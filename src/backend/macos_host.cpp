@@ -2647,6 +2647,7 @@ static std::vector<unsigned char> llm_service_cookie;
 static unsigned llm_service_events = 0;
 static std::atomic<bool> llm_service_finished{false};
 static void llm_service_callback(LlmEvent event) {
+  bool finished = false;
   fprintf(stdout, "LLM_EVENT chat=%d frame=%d error=%d end=%d results=%u\n",
           event.chat_id, event.frame, event.error_code, event.is_end,
           event.result_count);
@@ -2670,10 +2671,12 @@ static void llm_service_callback(LlmEvent event) {
     std::string metadata(item.text ? item.text : "", item.text_length);
     if (metadata.find("\"is_answer_end\":1") != std::string::npos ||
         metadata.find("\"is_answer_end\":true") != std::string::npos)
-      llm_service_finished = true;
+      finished = true;
   }
-  if (event.is_end)
-    llm_service_finished = true;
+  // is_end terminates this transport frame. A nonempty cookie continues the
+  // answer in a later request, even when the current frame is complete.
+  if (event.is_end && (event.error_code || !event.cookie_length))
+    finished = true;
   {
     std::lock_guard lock(llm_service_mutex);
     llm_service_cookie.assign(event.cookie,
@@ -2682,6 +2685,10 @@ static void llm_service_callback(LlmEvent event) {
     ++llm_service_events;
   }
   fflush(stdout);
+  // Do not let the main thread exit before the final rendered document has
+  // been flushed by this callback.
+  if (finished)
+    llm_service_finished = true;
 }
 struct LlmSearchParam {
   const char *text;
@@ -2807,6 +2814,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   service_mode = !strcmp(argv[2], "serve") ||
+                 !strcmp(argv[2], "voice-service") ||
                  !strcmp(argv[2], "flurry-server") ||
                  !strcmp(argv[2], "flurry-wxp2p-server") ||
                  !strcmp(argv[2], "wxp2p-probe");
@@ -2859,6 +2867,12 @@ int main(int argc, char **argv) {
       return 2;
     const auto flags = capabilities();
     auto report = wire::object();
+    auto unicode = wire::object();
+    wire::put(unicode.get(), "text", std::string(u8"中文🙂"));
+    auto roundtrip = wire::parse(wire::dump(unicode.get()));
+    const bool jsonReady = wire::str(roundtrip.get(), "text") == u8"中文🙂";
+    wire::put(report.get(), "json_c_version", std::string(json_c_version()));
+    wire::boolean(report.get(), "utf8_json", jsonReady);
     wire::put(report.get(), "libcurl_version", std::string(version()));
     wire::put(report.get(), "provider", std::string(provider()));
     wire::boolean(report.get(), "ws", flags & 1);
@@ -2867,7 +2881,7 @@ int main(int argc, char **argv) {
     wire::put(report.get(), "address_policy",
               std::string("happy-eyeballs-200ms-with-ipv4-retry"));
     puts(wire::dump(report.get()).c_str());
-    return (flags & 3) == 3 ? 0 : 1;
+    return (flags & 3) == 3 && jsonReady ? 0 : 1;
   }
   std::string dir = argv[1], mode = argv[2], line;
   std::vector<std::string> binds, unwinds;
@@ -2958,6 +2972,59 @@ int main(int argc, char **argv) {
           tls_total = address + size;
       }
     }
+    // Older prepared runtimes omitted the app's plain C voice wrappers from
+    // the manifest. Discover them in the existing, pinned thin Mach-O so an
+    // upgrade does not require replacing the user's working runtime.
+    if (mode == "voice-service" && !syms.count("_voice_engine_create")) {
+      uint32_t header[8]{};
+      struct stat info{};
+      if (fstat(module, &info) || pread(module, header, sizeof(header), 0) !=
+                                    ssize_t(sizeof(header)) ||
+          header[0] != 0xfeedfacf || header[4] > 4096)
+        return false;
+      off_t position = sizeof(header);
+      for (unsigned i = 0; i < header[4]; ++i) {
+        uint32_t command[6]{};
+        if (pread(module, command, sizeof(command), position) !=
+                ssize_t(sizeof(command)) || command[1] < 8 ||
+            command[1] > 16777216 || position + command[1] > info.st_size)
+          return false;
+        if (command[0] == 2) {
+          struct Symbol {
+            uint32_t name;
+            uint8_t type, section;
+            uint16_t description;
+            uint64_t address;
+          };
+          if (command[3] > 1000000 || command[5] > 67108864 ||
+              uint64_t(command[2]) + uint64_t(command[3]) * sizeof(Symbol) >
+                  uint64_t(info.st_size) ||
+              uint64_t(command[4]) + command[5] > uint64_t(info.st_size))
+            return false;
+          std::vector<Symbol> symbols(command[3]);
+          std::string names(command[5], '\0');
+          if (pread(module, symbols.data(), symbols.size() * sizeof(Symbol),
+                    command[2]) != ssize_t(symbols.size() * sizeof(Symbol)) ||
+              pread(module, names.data(), names.size(), command[4]) !=
+                  ssize_t(names.size()))
+            return false;
+          for (const auto &symbol : symbols) {
+            if (!symbol.address || symbol.name >= names.size())
+              continue;
+            const auto end = names.find('\0', symbol.name);
+            if (end == std::string::npos)
+              continue;
+            const auto name = names.substr(symbol.name, end - symbol.name);
+            if (name.compare(0, 14, "_voice_engine_") == 0) {
+              syms[name] = symbol.address;
+              address_names.emplace_back(symbol.address, name);
+            }
+          }
+          break;
+        }
+        position += command[1];
+      }
+    }
     close(module);
     return true;
   };
@@ -3038,14 +3105,18 @@ int main(int argc, char **argv) {
   // remain outside this compatibility boundary.
   const bool verbose_host = getenv("WETYPE_HOST_DEBUG");
   for (auto &[addr, name] : ctors) {
-    if (addr < 0x1005f51c0 || addr >= 0x101b00000)
+    const bool voiceLogger = mode == "voice-service" &&
+                             name.find("wx_zhiling_tlogger") != std::string::npos;
+    if (!voiceLogger && (addr < 0x1005f51c0 || addr >= 0x101b00000))
       continue;
     if (verbose_host)
       fprintf(stderr, "CTOR %lx %s\n", addr, name.c_str());
     ((void (*)())addr)();
   }
   fprintf(stderr, "CORE_CONSTRUCTORS_RETURNED\n");
-  if (mode == "business-service")
+  if (mode == "voice-service")
+    setenv("WETYPE_VOICE_STREAM", "1", 1);
+  if (mode == "business-service" || mode == "voice-service")
     business_service();
   // Version-pinned wxime initialization ABI.
   alignas(16) unsigned char config[1024]{};

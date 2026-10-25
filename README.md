@@ -34,12 +34,13 @@
 | 能力 | Linux 集成状态 |
 | --- | --- |
 | 全拼、双拼、五笔 | 使用原版 macOS 2.2.3.657 输入核心和词典 |
-| 智能拼写与云候选 | 原版本地候选与桌面云候选合并 |
+| 智能拼写与云候选 | 原版本地候选与桌面云候选合并，云端新增候选带 ☁ 标记 |
+| 微信表情 | 仅在可识别的微信客户端中推荐，候选显示用户安装包中的原图；普通 emoji 保留 |
 | Fcitx5 输入体验 | 原生 input method 插件、内嵌预编辑、分页与选词 |
 | 账户与设备 | 官方六位匹配码、确认配对、设备组和功能开关 |
 | 跨设备剪贴板 | 文字与原始 PNG 图片双向同步 |
 | 个人词库与常用语 | 本地持久化；设备组同步器已接入 |
-| 语音输入 | PipeWire 录音、Opus 编码、原版在线识别与回填 |
+| 语音输入 | PipeWire 流式采集，原版语音引擎编码、VAD、识别、整理与实时预编辑 |
 | 问 AI | `=` 上下文触发、真实在线回答和独立问答窗口 |
 | 隔空传送 | 官方传输码与二维码、原版 Flurry LAN 与 WXP2P 直连/中继通道 |
 | V 模式 | 原版计算候选，以及计算、剪贴板、常用语和符号快捷栏 |
@@ -73,7 +74,7 @@ WeTypeX 插件 ────────── 候选、预编辑、快捷键、�
 从 [GitHub Releases](https://github.com/panxuc/fcitx5-wetypex/releases/latest) 下载软件包：
 
 ```bash
-sudo pacman -U ./fcitx5-wetypex-2.2.3.657-10-x86_64.pkg.tar.zst
+sudo pacman -U ./fcitx5-wetypex-2.2.3.657-13-x86_64.pkg.tar.zst
 ```
 
 也可以从 AUR 安装：
@@ -84,12 +85,12 @@ paru -S fcitx5-wetypex
 
 安装完成后，Pacman 会在终端中打印首次设置步骤。
 
-发布包依赖 Fcitx5、LibIME、Qt 6、Bubblewrap、PipeWire、FFmpeg、libc++、curl、json-c、libnotify 和 Polkit。Pacman 会从已配置的软件仓库解析依赖。
+发布包依赖 Fcitx5、LibIME、Qt 6、Bubblewrap、PipeWire、FFmpeg、libc++、curl、json-c、libnotify 和 Polkit；微信表情原图显示还使用 fontconfig、fontTools 和 Pillow。Pacman 会从已配置的软件仓库解析依赖。
 
 ### Debian 与 Ubuntu
 
 ```bash
-sudo apt install ./fcitx5-wetypex_2.2.3.657-10_amd64.deb
+sudo apt install ./fcitx5-wetypex_2.2.3.657-13_amd64.deb
 ```
 
 从修订 `8` 起，标准 deb 使用 Ubuntu 22.04 的 glibc 2.35、Qt5 和稳定版 Fcitx5 构建，可用于 Ubuntu 22.04、24.04、26.04 及 Debian 12/13。LLVM unwinder 已显式列入依赖，Ubuntu 26.04 会安装 `llvm-libunwind1`，避免核心因缺少 `libunwind.so.1` 无法启动。
@@ -101,7 +102,7 @@ Ubuntu 20.04 和 glibc 2.31 的系统使用独立的 `fcitx5-wetypex-legacy_..._
 ### Fedora 与兼容的 RPM 发行版
 
 ```bash
-sudo dnf install ./fcitx5-wetypex-2.2.3.657-10.x86_64.rpm
+sudo dnf install ./fcitx5-wetypex-2.2.3.657-13.x86_64.rpm
 ```
 
 FFmpeg 及部分桌面依赖可能来自发行版启用的附加软件仓库。
@@ -111,7 +112,7 @@ RPM 以 Fedora 40 为构建基线。Arch 是滚动发行版，发布包跟随当
 ### 便携归档
 
 ```bash
-sudo tar --zstd -C / -xf ./fcitx5-wetypex-2.2.3.657-10-linux-x86_64.tar.zst
+sudo tar --zstd -C / -xf ./fcitx5-wetypex-2.2.3.657-13-linux-x86_64.tar.zst
 ```
 
 便携归档不经过软件包管理器解析依赖，更适合已经准备好运行环境的系统。
@@ -133,6 +134,8 @@ sudo cmake --install build
 准备官方运行时有两种方式。
 
 使用已经下载的官方安装包：
+
+固定版本的官方下载地址：[WeType_2.2.3_657.zip](https://download.weread.qq.com/app/wxkb/mac/2.2.3/WeType_2.2.3_657.zip)。
 
 ```bash
 fcitx5-wetypex-setup --archive /path/to/WeType_2.2.3_657.zip
@@ -176,10 +179,10 @@ fcitx5-wetypex-account sync-now     # 请求个人词库与常用语同步
 - `-` / `=`：组合输入时向上、向下翻页。
 - `=`：没有拼音组合时，使用光标前的文本打开问 AI。
 - `V`：打开快捷工具栏，再按 `V`、`Esc` 或点击“关闭”结束；点击剪贴板、常用语或符号后，内容会插入原输入框。选择“计算”后直接输入表达式，按空格或回车选取结果。
-- `Ctrl + Win + Shift`：启动语音输入，再按任意键结束。
+- `Ctrl + Win + Shift`：启动或结束语音输入；`Ctrl + Win` 按住说话、松开结束。录音时可用空格结束、Enter 提交当前结果、Esc 取消，详见[流式语音输入](docs/voice-input.md)。
 - `Ctrl + Win`：按住说话，松开结束。
 
-外观中的“候选序号样式”可选择微信风格或 Fcitx 默认标签。Wayland 下的 V 工具栏优先使用 layer-shell 保持原输入框焦点；构建依赖与兼容回退见[故障排查](docs/troubleshooting.md#wayland-下-v-工具栏闪退或不显示)。
+外观中的“候选序号样式”可选择微信风格或 Fcitx 默认标签。Wayland 下的 V 工具栏优先使用 layer-shell 保持原输入框焦点，并尽量限制在当前窗口范围内，避免点击时焦点落到下方窗口；构建依赖与兼容回退见[故障排查](docs/troubleshooting.md#wayland-下-v-工具栏闪退或不显示)。Hyprland 0.55+ 的窗口规则与 app_id 配置见[Hyprland 兼容](docs/hyprland.md)。
 
 所有快捷键、输入方式、候选数量、主题、模糊音和同步开关也会出现在 Fcitx5 自带的输入法配置页中；同一页面提供完整设置、账号与同步入口，采用与 Fcitx5 拼音词典管理器相同的 `ExternalOption` 扩展机制。配置项说明见[配置参考](docs/configuration.md)。
 
@@ -219,6 +222,9 @@ fcitx5-diagnose | less
 - [架构说明](docs/architecture.md)
 - [功能状态](docs/feature-status.md)
 - [配置参考](docs/configuration.md)
+- [Linux 微信表情原图与应用识别](docs/wechat-emoticons.md)
+- [流式语音输入与诊断](docs/voice-input.md)
+- [Hyprland 兼容](docs/hyprland.md)
 - [故障排查](docs/troubleshooting.md)
 - [发行与打包](docs/distribution.md)
 

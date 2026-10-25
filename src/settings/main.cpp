@@ -807,7 +807,7 @@ int main(int argc, char **argv) {
   auto *emojiSetup = new QPushButton("设置...");
   QObject::connect(emojiSetup, &QPushButton::clicked, [&window] {
     runToggleDialog(&window, "表情和颜文字推荐",
-                    {{"微信表情", "wechat_emoji", true},
+                    {{"微信表情（仅微信客户端）", "wechat_emoji", true},
                      {"Emoji", "normal_emoji", true},
                      {"颜文字", "kaomoji", true},
                      {"大表情", "large_emoji", true},
@@ -1103,6 +1103,20 @@ int main(int argc, char **argv) {
                                                                      : 1;
   theme->setCurrentIndex(themeMode);
   visual.body->addWidget(rowsCard({row("主题模式", {}, theme, 48)}));
+  auto *preeditPosition = new QComboBox;
+  preeditPosition->addItems({"输入框内", "候选框内"});
+  preeditPosition->setCurrentIndex(
+      settings.value("preedit_position").toString() == "candidate" ? 1 : 0);
+  visual.body->addWidget(rowsCard(
+      {row("拼音显示位置", "输入框不支持内嵌拼音时，自动显示在候选框内",
+           preeditPosition, 64)}));
+  QObject::connect(preeditPosition,
+                   qOverload<int>(&QComboBox::currentIndexChanged),
+                   [=](int index) {
+                     writeSetting("preedit_position",
+                                  index == 1 ? QStringLiteral("candidate")
+                                             : QStringLiteral("client"));
+                   });
   auto *labelStyle = new QComboBox;
   labelStyle->addItems({"微信风格", "Fcitx 默认"});
   labelStyle->setCurrentIndex(

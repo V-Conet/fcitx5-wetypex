@@ -29,6 +29,8 @@ enum class ThemeMode { System, Light, Dark };
 FCITX_CONFIG_ENUM_NAME(ThemeMode, "跟随系统", "浅色", "深色")
 enum class CandidateLabelStyle { WeType, Fcitx };
 FCITX_CONFIG_ENUM_NAME(CandidateLabelStyle, "微信风格", "Fcitx 默认")
+enum class PreeditPosition { Client, Candidate };
+FCITX_CONFIG_ENUM_NAME(PreeditPosition, "输入框内", "候选框内")
 enum class VoicePunctuationMode { Smart, Full, NoPeriod, Spaces };
 FCITX_CONFIG_ENUM_NAME(VoicePunctuationMode, "智能标点", "添加完整标点",
                        "句末不加句号", "空格替换标点")
@@ -49,7 +51,8 @@ FCITX_CONFIGURATION(
     Option<bool> smartInput{this, "SmartInput", "智能拼写", true};
     Option<bool> emojiRecommend{this, "EmojiRecommend", "表情和颜文字推荐",
                                 true};
-    Option<bool> wechatEmoji{this, "WechatEmoji", "微信表情推荐", true};
+    Option<bool> wechatEmoji{this, "WechatEmoji",
+                             "微信表情推荐（仅微信客户端）", true};
     Option<bool> normalEmoji{this, "NormalEmoji", "Emoji 推荐", true};
     Option<bool> kaomoji{this, "Kaomoji", "颜文字推荐", true};
     Option<bool> largeEmoji{this, "LargeEmoji", "大表情推荐", true};
@@ -118,6 +121,8 @@ FCITX_CONFIGURATION(
     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
                                        IntConstrain(3, 9)};
     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
+    Option<PreeditPosition> preeditPosition{
+        this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
     Option<CandidateLabelStyle> labelStyle{this, "CandidateLabelStyle",
                                            "候选序号样式",
                                            CandidateLabelStyle::WeType};

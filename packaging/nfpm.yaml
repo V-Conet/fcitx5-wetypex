@@ -2,7 +2,7 @@ name: fcitx5-wetypex
 arch: amd64
 platform: linux
 version: "@WETYPEX_VERSION@"
-release: "10"
+release: "13"
 section: utils
 priority: optional
 maintainer: WeTypeX contributors <https://github.com/panxuc/fcitx5-wetypex>
@@ -38,6 +38,11 @@ overrides:
       - bubblewrap
       - util-linux
       - python3
+      - python3-fonttools
+      - python3-pil
+      - fontconfig
+      - libfontconfig1
+      - libwayland-client0
       - pipewire-bin | pipewire
       - ffmpeg
       - wl-clipboard
@@ -60,6 +65,10 @@ overrides:
       - bubblewrap
       - util-linux
       - python3
+      - python3-fonttools
+      - python3-pillow
+      - fontconfig
+      - libwayland-client
       - pipewire-utils
       - /usr/bin/ffmpeg
       - wl-clipboard

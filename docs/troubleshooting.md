@@ -30,6 +30,10 @@ fcitx5-wetypex-setup --archive /path/to/WeType_2.2.3_657.zip
 
 散列不匹配时不要绕过校验。下载或版本变化可能意味着 ABI 不兼容。
 
+## 界面正常，但中文没有候选或无法上屏
+
+运行 `fcitx5-wetypex-account network-info`，检查 `json_c_version` 和 `utf8_json`。后者应为 `true`。json-c 0.18 的严格模式存在将中文 UTF-8 字节误判为控制字符的问题，WeTypeX 在解析前做兼容转换并保留严格语法、UTF-8 和尾随数据校验。升级到包含该修复的构建即可使用系统原有 json-c；`fcitx5-wetypex-setup --check` 也会检查该兼容链路。
+
 ## 本地候选正常，但没有云候选
 
 先运行 `fcitx5-wetypex-account network-info`。默认构建应显示 `provider: bundled-static`、`ws: true`、`wss: true`；输出不需要读取配对身份，也不会联网。Ubuntu 24.04 的系统 libcurl 8.5 关闭了 WebSocket，修复版桥接使用自己的 libcurl。连接采用 Happy Eyeballs，并在网络/TLS 建连失败时于同一超时预算内尝试 IPv4；无需修改 `/etc/hosts` 固定上游 IP。
@@ -67,7 +71,43 @@ Ubuntu 20.04 自带 PipeWire 0.2，语音录制需要升级到提供 `pw-record`
 pw-record --rate 16000 --channels 1 --format s16 /tmp/wetypex-test.wav
 ```
 
-录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后检查 `state/voice/last-record.log`。识别需要联网、有效账户身份和 FFmpeg 的 Opus 编码器。
+录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后运行 `fcitx5-wetypex-voice status`，检查 `native_ready`、`vad`、`state` 和时间字段。录音错误见 `state/voice/capture.log`，原版宿主错误见 `state/voice/backend.log`。识别需要联网；首次使用会初始化设备身份。编码和分块由原版引擎完成，FFmpeg 仅用于已有音频文件的解码。原版 VAD 模型可用 `--icons-only` 更新，具体操作见[流式语音输入](voice-input.md)。
+
+## 输入框周期性失焦，候选框消失并留下拼音
+
+Ubuntu 26.04、Plasma/KWin 6.6.6、wl-clipboard 2.2.1 下曾观察到，设备剪贴板同步轮询时 `wl-paste` 的临时窗口获得焦点，打断未完成的拼音；普通 Fcitx 拼音和浏览器也会受影响。旧版 wl-clipboard 只支持 `wlr-data-control`，而部分 KWin 版本只公布 `ext-data-control`；wl-clipboard 从 2.3 开始支持后者。只在日志里看到 `data_control` 字样不足以确认两者兼容。
+
+同步守护进程通过剪贴板助手查询 Wayland registry，再核对 `wl-paste`、`wl-copy` 的版本。探测只列举协议，不读取剪贴板、不创建窗口。兼容时继续使用原生 Wayland；缺少共同协议或连接状态不明时，通过 Qt/XWayland 无窗口读写。无窗口连接失败会跳过本轮并稍后重试，不退回可能抢焦点的 `wl-paste`/`wl-copy`。X11 连接使用 `DISPLAY` 和实际可用的认证配置，也支持未显式设置 `XAUTHORITY` 的会话。 文字读取优先选择 UTF-8 格式；同步进程管理的剪贴板助手会持续持有内容，直到所有权被替换或同步进程退出。
+
+可单独查看当前桌面的协议（空输出表示未公布支持的 data-control 协议）：
+
+```bash
+fcitx5-wetypex-clipboard-set --wayland-clipboard-protocols
+wl-paste --version
+wl-copy --version
+```
+
+升级后需要让旧的 `fcitx5-wetypex-syncd` 进程退出并启动新版本。KDE Wayland 可保存工作后注销并重新登录；只重新加载配置不一定会替换仍在运行的旧同步进程。重新测试时，在浏览器或编辑器中输入拼音、等待至少 10 秒，确认焦点和候选框保持。
+
+## Electron 在 Wayland 下候选框固定在左上角
+
+先在同一个应用中对照 Fcitx 拼音，并确认 KDE“系统设置 → 键盘 → 虚拟键盘”选择了 Fcitx5。WeTypeX 使用 Fcitx 的面板定位；客户端提供的输入表面和光标矩形决定面板位置。
+
+对支持原生 Wayland 和 text-input-v3 的 Electron 应用，可仅在该应用的启动命令中使用：
+
+```bash
+env -u GTK_IM_MODULE -u QT_IM_MODULE application --ozone-platform=wayland --enable-wayland-ime --wayland-text-input-version=3
+```
+
+这里的 `application` 换成应用实际可执行文件。KWin 6.8 提供 text-input-v2/v3，旧版本上建议的 v1 参数不适用于这个组合。已用 KWin 6.8 的独立会话和原生 Wayland VS Code 验证 v3 路线：应用发送的光标矩形随编辑位置更新，候选框跟随插入点。
+
+部分应用内置的 Electron/Chromium 版本较旧，或启动器会覆盖参数。此时对该应用使用 XWayland，并提供对应的 Gtk 输入法模块：
+
+```bash
+env GTK_IM_MODULE=fcitx application --ozone-platform=x11
+```
+
+Arch 的模块包为 `fcitx5-gtk`，Debian/Ubuntu 通常使用 `fcitx5-frontend-gtk3`；版本应与当前 Fcitx 框架匹配。可把上述命令写入该应用的用户级 `.desktop` 启动项，保留原命令中的路径和占位参数。环境调整只用于对应应用，其他 Qt/Gtk 应用继续使用各自适合的输入方式。
 
 ## Wayland 下 V 工具栏闪退或不显示
 
@@ -77,9 +117,11 @@ V 工具栏在支持 `zwlr_layer_shell_v1` 的 Wayland 合成器上使用不接�
 
 标准 deb 使用 Qt5 并保留跨发行版基线；Ubuntu 26.04 和 Debian 13 已不再提供 Qt5 的 LayerShellQt，所以 deb 在 Wayland 会话使用原生候选菜单，避免新增不可解析的旧库依赖。Qt5.12 的 legacy 包采用相同回退。X11 会话仍使用独立工具栏；显式指定 `QT_QPA_PLATFORM=xcb` 时也保留该选择。原生 Wayland 的本机源码构建可安装匹配 Qt 主版本的 LayerShellQt 开发包、运行时 shell 插件及 `wayland-client`，启用独立工具栏。
 
+Hyprland 0.55+ 使用 Lua 配置。安装的 `hyprland.lua` 只包含设置、隔空传送和 AI 窗口的浮动/居中规则；V 工具栏是 layer-shell 表面，不受 `hl.window_rule` 影响。Wayland 光标矩形是相对输入表面的坐标，Hyprland 下由 `state/vmode.log` 中的 `placement:` 行记录解析后的锚点、显示器、工作区和当前窗口范围，可用来确认定位来源。工具栏会优先限制在当前窗口内，避免点击时焦点落到下方窗口；窗口过小时退回显示器工作区。工具栏位置异常时不要用窗口规则尝试修复，应检查 LayerShellQt、合成器协议和该日志。加载方式和验证命令见 [Hyprland 兼容](hyprland.md)。
+
 单实例守卫使用 `flock`。`state/vmode.lock` 文件保留在磁盘上，进程退出（包括 SIGTERM、SIGKILL）后内核自动释放锁；文件存在不表示工具栏仍在运行，无需手工删除。删除活实例使用的锁文件会破坏互斥，应先关闭工具栏。
 
-仍有异常时检查 `state/vmode.log`，其中记录最近一次启动使用的窗口协议、Qt 错误和轮询关闭原因，不记录输入内容。
+仍有异常时检查 `state/vmode.log`，其中记录最近一次启动使用的窗口协议、定位参数、按钮动作和轮询关闭原因，不记录输入内容。
 
 ## AI 窗口空白或缺图标
 

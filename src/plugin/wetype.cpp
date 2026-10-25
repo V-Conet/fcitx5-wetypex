@@ -1,9 +1,11 @@
 #include "../common/json.hpp"
 #include "config.hpp"
+#include "wechat_emoji.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <clipboard_public.h>
 #include <csignal>
+#include <cstddef>
 #include <cstring>
 #include <fcitx-utils/capabilityflags.h>
 #include <fcitx-utils/event.h>
@@ -21,6 +23,7 @@
 #include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputcontextproperty.h>
 #include <fcitx/inputmethodengine.h>
+#include <fcitx/inputmethodentry.h>
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
 #include <fcitx/statusarea.h>
@@ -32,12 +35,14 @@
 #include <iterator>
 #include <libime/pinyin/pinyinencoder.h>
 #include <map>
+#include <poll.h>
 #include <queue>
 #include <spawn.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <type_traits>
 #include <unistd.h>
@@ -219,7 +224,7 @@ struct State : InputContextProperty {
   uint8_t symbolAutoState = 0;
   bool doubleQuoteLeft = true, singleQuoteLeft = true;
   bool english = false, fullWidth = false, traditional = false,
-       englishPunctuation = false, vMode = false;
+       englishPunctuation = false, vMode = false, vCalculator = false;
   bool selectionPending = false;
   std::vector<DeferredKey> deferredKeys;
   VMenu vMenu = VMenu::None;
@@ -263,6 +268,8 @@ public:
 class WeType : public InputMethodEngine {
   friend class VMenuWord;
   Instance *instance_;
+  wetype::WeChatEmoticons wechatEmoticons_{WETYPE_WECHAT_EMOTICONS};
+  bool wechatFont_ = wetype_emoji::originalFontAvailable();
   uint64_t nextId_ = 0;
   FactoryFor<State> factory_;
   SimpleAction settingsAction_;
@@ -272,19 +279,27 @@ class WeType : public InputMethodEngine {
   int read_ = -1, write_ = -1;
   std::unique_ptr<EventSourceIO> reader_, writer_;
   std::unique_ptr<EventSourceTime> timer_;
+  std::unique_ptr<HandlerTableEntry<EventHandler>> languageModifierWatcher_;
   bool ready_ = false, failed_ = false;
   uint64_t activity_ = 0;
   uint64_t restartAt_ = 0, restartBackoff_ = 250000;
   bool restartNeedsOpen_ = false;
   uint64_t syncTick_ = 0, updateTick_ = 0;
+  uint64_t voiceWarmTick_ = 0;
   uint64_t lastVoiceVersion_ = 0;
   pid_t vModeChild_ = -1;
   uint64_t vModeSession_ = 0, vModeEpoch_ = 0, vModeGeneration_ = 0;
   std::string vModeToken_;
   bool vModeNative_ = false;
+  uint64_t vModeFocusDeadline_ = 0;
+  bool vModeFallbackPending_ = false;
   std::string inbound_, outbound_;
-  bool voiceRecording_ = false, voiceHold_ = false;
+  bool voiceRecording_ = false, voiceHold_ = false, voicePending_ = false;
   uint64_t voiceSession_ = 0, voiceEpoch_ = 0;
+  uint64_t voiceStatusUntil_ = 0;
+  pid_t voiceDaemonPid_ = 0;
+  std::string voiceToken_, voiceText_, voicePhase_, voiceError_;
+  int voiceLevel_ = 0;
   pid_t syncChild_ = -1;
   void startSync() {
     if (syncChild_ > 0 && waitpid(syncChild_, nullptr, WNOHANG) == 0)
@@ -554,6 +569,10 @@ class WeType : public InputMethodEngine {
     appearance->candidateSize.setValue(
         std::clamp(int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
     appearance->vertical.setValue(vertical_);
+    appearance->preeditPosition.setValue(
+        wire::str(j.get(), "preedit_position") == "candidate"
+            ? wetype_config::PreeditPosition::Candidate
+            : wetype_config::PreeditPosition::Client);
     appearance->labelStyle.setValue(
         wire::str(j.get(), "candidate_label_style") == "fcitx"
             ? wetype_config::CandidateLabelStyle::Fcitx
@@ -698,6 +717,11 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
     wire::put(json.get(), "candidate_size", int64_t(*appearance.candidateSize));
     wire::put(json.get(), "vertical", bool(*appearance.vertical));
+    wire::put(json.get(), "preedit_position",
+              std::string(*appearance.preeditPosition ==
+                                  wetype_config::PreeditPosition::Candidate
+                              ? "candidate"
+                              : "client"));
     wire::put(json.get(), "candidate_label_style",
               std::string(*appearance.labelStyle ==
                                   wetype_config::CandidateLabelStyle::Fcitx
@@ -883,45 +907,178 @@ class WeType : public InputMethodEngine {
       std::filesystem::rename(temporary, path, error);
     }
   }
+  bool voiceControl(const char *operation, bool traditional = false) {
+    std::ifstream input(stateDirectory() / "voice/control.json");
+    std::string bytes(1025, '\0');
+    input.read(bytes.data(), bytes.size());
+    bytes.resize(input.gcount());
+    if (bytes.size() > 1024)
+      return false;
+    auto control = wire::parse(bytes);
+    if (wire::number(control.get(), "version") != 1)
+      return false;
+    const auto address = wire::str(control.get(), "address");
+    const auto prefix = "wetypex-voice-" + std::to_string(getuid()) + "-";
+    sockaddr_un socketAddress{};
+    if (address.compare(0, prefix.size(), prefix) != 0 ||
+        address.size() + 1 > sizeof(socketAddress.sun_path))
+      return false;
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+      return false;
+    socketAddress.sun_family = AF_UNIX;
+    memcpy(socketAddress.sun_path + 1, address.data(), address.size());
+    struct ucred peer{};
+    socklen_t peerSize = sizeof(peer);
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&socketAddress),
+                offsetof(sockaddr_un, sun_path) + 1 + address.size()) ||
+        getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peerSize) ||
+        peer.uid != getuid()) {
+      close(fd);
+      return false;
+    }
+    auto message = wire::object();
+    wire::put(message.get(), "op", std::string(operation));
+    wire::put(message.get(), "token", voiceToken_);
+    wire::put(message.get(), "session", int64_t(voiceSession_));
+    wire::put(message.get(), "epoch", int64_t(voiceEpoch_));
+    wire::put(message.get(), "pid", int64_t(getpid()));
+    wire::put(message.get(), "traditional", traditional);
+    const auto payload = wire::dump(message.get()) + '\n';
+    bool delivered = ::send(fd, payload.data(), payload.size(),
+                           MSG_NOSIGNAL | MSG_DONTWAIT) == ssize_t(payload.size());
+    if (delivered) {
+      pollfd wait{fd, POLLIN, 0};
+      char ack;
+      // Local control normally completes in less than a millisecond. Bound
+      // the GUI wait and fall back to the helper if the daemon is restarting.
+      delivered = ::poll(&wait, 1, 5) > 0 && ::recv(fd, &ack, 1, MSG_DONTWAIT) == 1;
+    }
+    close(fd);
+    if (delivered && std::string_view(operation) == "start")
+      voiceDaemonPid_ = peer.pid;
+    return delivered;
+  }
+  void primeVoice() {
+    voiceWarmTick_ = now(CLOCK_MONOTONIC);
+    if (networkEnabled_ &&
+        (*config_.voice->launchShortcut || *config_.voice->holdShortcut) &&
+        !voiceControl("status"))
+      startProcess({WETYPE_VOICE, "status"});
+  }
+  bool flushBeforeVoice(InputContext *ic, KeyEvent &event) {
+    auto *s = state(ic);
+    if (s->vMode || s->vMenu != VMenu::None ||
+        (s->preedit.empty() && s->inputSeq <= s->applied))
+      return false;
+    const auto fallback = s->preedit;
+    if (send(ic, "raw")) {
+      s->selectionPending = true;
+      // Re-enter the shortcut after the queued letters have committed, just
+      // as later typing waits behind a candidate selection. Do not discard
+      // unfinished spelling when dictation starts.
+      s->deferredKeys.push_back({event.rawKey(), event.isRelease(), event.time()});
+      ic->inputPanel().setCandidateList(nullptr);
+      panel(ic, s);
+      return true;
+    }
+    if (!fallback.empty())
+      ic->commitString(fallback);
+    return false;
+  }
   void startVoice(InputContext *ic, bool hold) {
-    if (voiceRecording_ || ic->capabilityFlags().test(CapabilityFlag::Password))
+    if (voicePending_ || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
     auto *s = state(ic);
-    if (!s->preedit.empty()) {
-      send(ic, "reset");
-      s->preedit.clear();
-      s->cursor = 0;
-      clearDisplayState(s);
-      ic->inputPanel().reset();
-      panel(ic, s);
-    }
+    if (s->vMode || s->vMenu != VMenu::None)
+      cancelVMode(ic, "voice input started");
+    ++s->epoch;
+    s->selectionPending = false;
+    s->deferredKeys.clear();
+    send(ic, "reset");
+    s->preedit.clear();
+    s->cursor = 0;
+    clearDisplayState(s);
+    ic->inputPanel().reset();
     voiceRecording_ = true;
+    voicePending_ = true;
     voiceHold_ = hold;
     voiceSession_ = s->id;
     voiceEpoch_ = s->epoch;
-    startProcess({WETYPE_VOICE, "start"});
+    voiceToken_ = std::to_string(getpid()) + "-" +
+                  std::to_string(now(CLOCK_MONOTONIC));
+    voiceText_.clear();
+    voiceError_.clear();
+    voicePhase_ = "recording";
+    voiceLevel_ = 0;
+    voiceStatusUntil_ = 0;
+    voiceDaemonPid_ = 0;
+    lastVoiceVersion_ = 0;
+    if (!voiceControl("start", s->traditional))
+      startProcess({WETYPE_VOICE, "start", std::to_string(voiceSession_),
+                    std::to_string(voiceEpoch_), voiceToken_,
+                    s->traditional ? "1" : "0"});
+    panel(ic, s);
   }
-  void stopVoice() {
-    if (!voiceRecording_)
+  void stopVoice(bool immediate = false) {
+    if (!voicePending_)
       return;
     voiceRecording_ = false;
     voiceHold_ = false;
-    startProcess({WETYPE_VOICE, "stop", std::to_string(voiceSession_),
-                  std::to_string(voiceEpoch_)});
+    voicePhase_ = "recognizing";
+    if (!voiceControl(immediate ? "finish" : "stop"))
+      startProcess({WETYPE_VOICE, immediate ? "finish" : "stop", voiceToken_});
+    auto it = contexts_.find(voiceSession_);
+    if (it != contexts_.end())
+      if (auto *ic = it->second.get(); ic && ic->hasFocus())
+        panel(ic, ic->propertyFor(&factory_));
+  }
+  void cancelVoice(bool notify = true) {
+    if (notify && voicePending_ && !voiceControl("cancel"))
+      startProcess({WETYPE_VOICE, "cancel", voiceToken_});
+    voicePending_ = voiceRecording_ = voiceHold_ = false;
+    voiceText_.clear();
+    voiceToken_.clear();
+    voicePhase_.clear();
+    voiceError_.clear();
+    voiceStatusUntil_ = 0;
+    voiceDaemonPid_ = 0;
+    auto it = contexts_.find(voiceSession_);
+    if (it != contexts_.end())
+      if (auto *ic = it->second.get(); ic && ic->hasFocus())
+        panel(ic, ic->propertyFor(&factory_));
   }
   void receiveVoice() {
+    if (voicePending_ && voiceDaemonPid_ > 1 &&
+        kill(voiceDaemonPid_, 0) < 0 && errno == ESRCH) {
+      cancelVoice(false);
+      voiceError_ = "语音服务已退出，请重新启动语音输入";
+      voiceStatusUntil_ = now(CLOCK_MONOTONIC) + 4000000;
+      auto it = contexts_.find(voiceSession_);
+      if (it != contexts_.end())
+        if (auto *ic = it->second.get(); ic && ic->hasFocus())
+          panel(ic, ic->propertyFor(&factory_));
+      return;
+    }
+    if (voiceStatusUntil_ && now(CLOCK_MONOTONIC) >= voiceStatusUntil_)
+      cancelVoice();
     std::ifstream input(stateDirectory() / "voice-inbox.json");
     std::string bytes((std::istreambuf_iterator<char>(input)), {});
     if (bytes.empty() || bytes.size() > 65536)
       return;
     auto message = wire::parse(bytes);
+    if (voiceToken_.empty() || wire::str(message.get(), "token") != voiceToken_)
+      return;
     auto version = uint64_t(wire::number(message.get(), "version"));
     auto text = wire::str(message.get(), "text");
-    if (!version || version <= lastVoiceVersion_ || text.empty())
+    if (!version || version <= lastVoiceVersion_)
       return;
     lastVoiceVersion_ = version;
-    std::error_code error;
-    std::filesystem::remove(stateDirectory() / "voice-inbox.json", error);
+    // The producer atomically replaces this file. Removing an older version
+    // after reading it can otherwise delete a newer final result.
+    const auto daemon = wire::number(message.get(), "daemon_pid");
+    if (daemon > 1 && daemon <= INT_MAX)
+      voiceDaemonPid_ = daemon;
     const auto session = uint64_t(wire::number(message.get(), "session"));
     const auto epoch = uint64_t(wire::number(message.get(), "epoch"));
     auto it = contexts_.find(session);
@@ -929,11 +1086,37 @@ class WeType : public InputMethodEngine {
       return;
     auto *ic = it->second.get();
     if (!ic || !ic->hasFocus() ||
-        ic->capabilityFlags().test(CapabilityFlag::Password))
+        ic->capabilityFlags().test(CapabilityFlag::Password)) {
+      cancelVoice();
       return;
+    }
     auto *s = ic->propertyFor(&factory_);
-    if (s->active && s->epoch == epoch)
-      ic->commitString(text);
+    if (!s->active || s->epoch != epoch || session != voiceSession_ ||
+        epoch != voiceEpoch_) {
+      cancelVoice();
+      return;
+    }
+    const auto phase = wire::str(message.get(), "state");
+    voicePhase_ = phase;
+    voiceText_ = text;
+    voiceLevel_ = std::clamp<int>(wire::number(message.get(), "level"), 0, 100);
+    if (phase != "recording")
+      voiceRecording_ = voiceHold_ = false;
+    if (phase == "final" || phase == "error" || phase == "cancelled") {
+      voicePending_ = false;
+      voiceText_.clear();
+      voiceToken_.clear();
+      voiceDaemonPid_ = 0;
+      if (phase == "error") {
+        voiceError_ = wire::str(message.get(), "error", "语音输入失败");
+        voiceStatusUntil_ = now(CLOCK_MONOTONIC) + 4000000;
+      } else
+        voicePhase_.clear();
+      panel(ic, s);
+      if (phase == "final" && !text.empty())
+        ic->commitString(text);
+    } else
+      panel(ic, s);
   }
   static void clearVMenu(State *s) {
     s->vMenu = VMenu::None;
@@ -1048,6 +1231,7 @@ class WeType : public InputMethodEngine {
     if (s->vMenu == VMenu::Main) {
       if (value == "calculator") {
         stopVModeWindow();
+        s->vCalculator = true;
         ic->inputPanel().reset();
         panel(ic, s);
       } else if (value == "clipboard") {
@@ -1099,6 +1283,8 @@ class WeType : public InputMethodEngine {
     vModeSession_ = vModeEpoch_ = 0;
     vModeToken_.clear();
     vModeNative_ = false;
+    vModeFocusDeadline_ = 0;
+    vModeFallbackPending_ = false;
   }
   void cancelVMode(InputContext *ic, const char *reason = "V mode cancelled") {
     auto *s = state(ic);
@@ -1107,6 +1293,7 @@ class WeType : public InputMethodEngine {
     ++s->epoch;
     send(ic, "reset");
     s->vMode = false;
+    s->vCalculator = false;
     s->preedit.clear();
     s->cursor = 0;
     clearDisplayState(s);
@@ -1123,14 +1310,22 @@ class WeType : public InputMethodEngine {
         stopVModeWindow();
     }
     const auto &rect = ic->cursorRect();
+    const bool relative =
+        ic->capabilityFlags().test(CapabilityFlag::RelativeRect);
+    double scale = ic->scaleFactor();
+    if (!(scale > 0.0))
+      scale = 1.0;
     vModeSession_ = s->id;
     vModeEpoch_ = s->epoch;
     vModeToken_ = std::to_string(getpid()) + "-" +
                   std::to_string(now(CLOCK_MONOTONIC)) + "-" +
                   std::to_string(++vModeGeneration_);
+    vModeFocusDeadline_ = 0;
+    vModeFallbackPending_ = false;
     std::vector<std::string> args{
         WETYPE_VMODE, std::to_string(s->id), std::to_string(rect.left()),
-        std::to_string(rect.bottom()), std::to_string(s->epoch), vModeToken_};
+        std::to_string(rect.bottom()), std::to_string(s->epoch), vModeToken_,
+        relative ? "1" : "0", std::to_string(scale)};
     std::vector<char *> argv;
     for (auto &arg : args)
       argv.push_back(arg.data());
@@ -1158,6 +1353,9 @@ class WeType : public InputMethodEngine {
       return true;
     }
     vModeChild_ = child;
+    std::ofstream log(logPath, std::ios::app);
+    log << "V toolbar start: rect=" << rect.left() << ',' << rect.bottom()
+        << " relative=" << relative << " scale=" << scale << '\n';
     return true;
   }
   void receiveVModeAction() {
@@ -1170,26 +1368,50 @@ class WeType : public InputMethodEngine {
     const auto session = uint64_t(wire::number(message.get(), "session"));
     const auto epoch = uint64_t(wire::number(message.get(), "epoch"));
     std::error_code error;
-    std::filesystem::remove(path, error);
     if (!session || session != vModeSession_ || epoch != vModeEpoch_ ||
-        vModeToken_.empty() || wire::str(message.get(), "token") != vModeToken_)
+        vModeToken_.empty() || wire::str(message.get(), "token") != vModeToken_) {
+      std::filesystem::remove(path, error);
       return;
+    }
     auto it = contexts_.find(session);
-    if (it == contexts_.end())
+    auto *ic = it == contexts_.end() ? nullptr : it->second.get();
+    if (!ic) {
+      std::filesystem::remove(path, error);
       return;
-    auto *ic = it->second.get();
-    if (!ic || !ic->hasFocus() ||
-        ic->capabilityFlags().test(CapabilityFlag::Password))
-      return;
+    }
     const auto action = wire::str(message.get(), "action");
     auto *s = state(ic);
-    if (!s->active || !s->vMode || s->epoch != epoch)
+    const bool password =
+        ic->capabilityFlags().test(CapabilityFlag::Password);
+    if (password || !s->active || !s->vMode || s->epoch != epoch) {
+      std::filesystem::remove(path, error);
+      std::ofstream log(stateDirectory() / "vmode.log", std::ios::app);
+      log << "V toolbar action dropped: " << action.substr(0, 32) << '\n';
       return;
+    }
     if (action == "cancel") {
+      std::filesystem::remove(path, error);
       cancelVMode(ic);
-    } else if (action == "calculator") {
+      return;
+    }
+    // Wait briefly for the original client to regain focus. A valid token
+    // identifies the session, but never grants permission to commit unfocused.
+    auto *focused = instance_->lastFocusedInputContext();
+    if (!ic->hasFocus() || (focused && focused != ic)) {
+      if (!focused && vModeFocusDeadline_ &&
+          now(CLOCK_MONOTONIC) < vModeFocusDeadline_)
+        return;
+      std::filesystem::remove(path, error);
+      cancelVMode(ic, "toolbar action target lost focus");
+      return;
+    }
+    std::filesystem::remove(path, error);
+    std::ofstream log(stateDirectory() / "vmode.log", std::ios::app);
+    log << "V toolbar action: " << action.substr(0, 32) << '\n';
+    if (action == "calculator") {
       // Keep the original core's armed VModeV2 session for keyboard input.
       stopVModeWindow();
+      s->vCalculator = true;
       panel(ic, s);
     } else if (action == "commit") {
       const auto text = wire::str(message.get(), "text");
@@ -1211,32 +1433,34 @@ class WeType : public InputMethodEngine {
       return;
     }
     auto *s = state(ic);
-    int status = 0;
+    auto *focused = instance_->lastFocusedInputContext();
+    const bool otherFocus = focused && focused != ic;
     const auto exited =
-        vModeChild_ > 0 ? waitpid(vModeChild_, &status, WNOHANG) : 0;
-    const bool fallback =
-        exited > 0 && exited == vModeChild_ && WIFEXITED(status) &&
-        (WEXITSTATUS(status) == 69 || WEXITSTATUS(status) == 127);
+        vModeChild_ > 0 ? waitpid(vModeChild_, nullptr, WNOHANG) : 0;
+    const bool exitedNow =
+        exited > 0 || (exited < 0 && errno == ECHILD);
     if (exited == vModeChild_ || (exited < 0 && errno == ECHILD))
       vModeChild_ = -1;
-    if (fallback && ic->hasFocus() && s->active && s->vMode &&
-        s->epoch == vModeEpoch_ &&
-        !ic->capabilityFlags().test(CapabilityFlag::Password)) {
+    vModeFallbackPending_ |= exitedNow;
+    const bool password = ic->capabilityFlags().test(CapabilityFlag::Password);
+    if (!otherFocus && s->active && s->vMode && s->epoch == vModeEpoch_ &&
+        !password && !ic->hasFocus() && !vModeNative_ && vModeFocusDeadline_ &&
+        now(CLOCK_MONOTONIC) < vModeFocusDeadline_)
+      return;
+    if (otherFocus || !ic->hasFocus() || !s->active || !s->vMode ||
+        s->epoch != vModeEpoch_ || password) {
+      cancelVMode(ic, "toolbar input context changed or focus grace expired");
+      return;
+    }
+    vModeFocusDeadline_ = 0;
+    if (vModeFallbackPending_) {
+      vModeFallbackPending_ = false;
       vModeNative_ = true;
       mainVMenu(ic);
       return;
     }
-    if ((vModeChild_ <= 0 && !vModeNative_) || !ic->hasFocus() || !s->active ||
-        !s->vMode || s->epoch != vModeEpoch_ ||
-        ic->capabilityFlags().test(CapabilityFlag::Password)) {
-      const auto *reason = vModeChild_ <= 0 && !vModeNative_ ? "process exited"
-                           : !ic->hasFocus() ? "input context lost focus"
-                           : !s->active      ? "input method deactivated"
-                           : !s->vMode       ? "V mode ended"
-                           : s->epoch != vModeEpoch_ ? "input session changed"
-                                                     : "password input context";
-      cancelVMode(ic, reason);
-    }
+    if (vModeChild_ <= 0 && !vModeNative_)
+      cancelVMode(ic, "toolbar process exited");
   }
   State *state(InputContext *ic) {
     auto *s = ic->propertyFor(&factory_);
@@ -1244,10 +1468,19 @@ class WeType : public InputMethodEngine {
     return s;
   }
   void panel(InputContext *ic, State *s) {
-    ic->inputPanel().setAuxUp(s->vMenu == VMenu::None ? Text()
-                                                      : Text(s->vMenuTitle));
+    const bool voice = voicePending_ && voiceSession_ == s->id &&
+                       voiceEpoch_ == s->epoch;
+    Text aux;
+    if (voice)
+      aux = Text("语音输入 " + std::string(voiceLevel_ / 12, '|'));
+    else if (s->vMenu != VMenu::None)
+      aux = Text(s->vMenuTitle);
+    else if (s->vCalculator)
+      aux = Text("计算：输入表达式，空格选取结果");
+    ic->inputPanel().setAuxUp(aux);
     const std::string displayed =
-        !s->displayPreedit.empty() ? s->displayPreedit
+        voice ? voiceText_
+        : !s->displayPreedit.empty() ? s->displayPreedit
         : !s->vMode && *config_.input->mode == wetype_config::InputMode::Pinyin
             ? formatPinyinPreedit(s->preedit)
             : s->preedit;
@@ -1256,11 +1489,14 @@ class WeType : public InputMethodEngine {
     if (!displayed.empty()) {
       text.append(displayed);
       text.setCursor(
-          !s->displayPreedit.empty()
+          voice ? displayed.size()
+          : !s->displayPreedit.empty()
               ? std::min(s->displayCursor, displayed.size())
               : displayCursorForRaw(s->preedit, displayed, s->cursor));
     }
     const bool inlinePreedit =
+        *config_.appearance->preeditPosition !=
+            wetype_config::PreeditPosition::Candidate &&
         ic->capabilityFlags().test(CapabilityFlag::Preedit) &&
         ic->isPreeditEnabled();
     ic->inputPanel().setClientPreedit(inlinePreedit ? text : Text());
@@ -1268,7 +1504,15 @@ class WeType : public InputMethodEngine {
     // to see the composition in the input panel.
     ic->inputPanel().setPreedit(inlinePreedit ? Text() : text);
     Text status;
-    if (!displayed.empty() && (failed_ || !ready_))
+    if (voice)
+      status.append(voicePhase_ == "polishing"
+                        ? "正在整理… Enter 立即上屏 · Esc 取消"
+                    : voiceRecording_
+                        ? "正在聆听… 空格结束 · Esc 取消"
+                        : "正在识别… Enter 立即上屏 · Esc 取消");
+    else if (voiceSession_ == s->id && voiceStatusUntil_)
+      status.append(voiceError_);
+    else if (!displayed.empty() && (failed_ || !ready_))
       status.append(failed_ ? "WeTypeX 核心正在恢复…" : "WeTypeX 核心启动中…");
     ic->inputPanel().setAuxDown(status);
     if (s->preedit.empty() && !s->vMode)
@@ -1308,6 +1552,7 @@ class WeType : public InputMethodEngine {
     invalidateSessions();
   }
   void invalidateSessions() {
+    cancelVoice();
     restartNeedsOpen_ = true;
     for (auto &[id, ref] : contexts_)
       if (auto *ic = ref.get()) {
@@ -1320,6 +1565,7 @@ class WeType : public InputMethodEngine {
         s->cursor = 0;
         clearDisplayState(s);
         s->vMode = false;
+        s->vCalculator = false;
         clearVMenu(s);
         s->cloudPollUntil = 0;
         s->pendingPairKey = 0;
@@ -1483,10 +1729,13 @@ class WeType : public InputMethodEngine {
               bool(*inputConfig.wubiWildcardComment));
     wire::put(json.get(), "smart_input", bool(*inputConfig.smartInput));
     wire::put(json.get(), "emoji_recommend", bool(*inputConfig.emojiRecommend));
-    wire::put(json.get(), "wechat_emoji", bool(*inputConfig.wechatEmoji));
+    const bool wechat = wetype::WeChatEmoticons::isWeChat(ic->program());
+    wire::put(json.get(), "wechat_emoji",
+              bool(*inputConfig.wechatEmoji) && wechat);
     wire::put(json.get(), "normal_emoji", bool(*inputConfig.normalEmoji));
     wire::put(json.get(), "kaomoji", bool(*inputConfig.kaomoji));
-    wire::put(json.get(), "large_emoji", bool(*inputConfig.largeEmoji));
+    wire::put(json.get(), "large_emoji",
+              bool(*inputConfig.largeEmoji) && wechat);
     wire::put(json.get(), "symbol_emoji", bool(*inputConfig.symbolEmoji));
     wire::put(json.get(), "v_mode", bool(*config_.shortcuts->vMode));
     wire::put(json.get(), "fuzzy_nl", bool(*inputConfig.fuzzyNl));
@@ -1549,8 +1798,8 @@ class WeType : public InputMethodEngine {
     }
     auto *s = state(ic);
     auto seq = uint64_t(wire::number(j.get(), "seq"));
-    if (uint64_t(wire::number(j.get(), "epoch")) != s->epoch ||
-        seq <= s->applied || seq > s->seq)
+    auto respEpoch = uint64_t(wire::number(j.get(), "epoch"));
+    if (respEpoch != s->epoch || seq <= s->applied || seq > s->seq)
       return;
     s->applied = seq;
     activity_ = now(CLOCK_MONOTONIC);
@@ -1623,6 +1872,7 @@ class WeType : public InputMethodEngine {
     list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
                                   : CandidateLayoutHint::Horizontal);
     auto *candidates = wire::get(j.get(), "candidates");
+    auto *cloudFlags = wire::get(j.get(), "cloud");
     if ((!s->preedit.empty() || s->vMode) && candidates &&
         json_object_is_type(candidates, json_type_array))
       for (size_t i = 0;
@@ -1631,10 +1881,27 @@ class WeType : public InputMethodEngine {
         auto *v = json_object_array_get_idx(candidates, i);
         if (json_object_is_type(v, json_type_string) &&
             json_object_get_string_len(v)) {
+          bool cloud = false;
+          if (cloudFlags && json_object_is_type(cloudFlags, json_type_array) &&
+              i < json_object_array_length(cloudFlags)) {
+            auto *flag = json_object_array_get_idx(cloudFlags, i);
+            cloud = json_object_is_type(flag, json_type_boolean) &&
+                    json_object_get_boolean(flag);
+          }
           std::string display =
               nativeLabels ? std::string{}
                            : std::to_string(list->totalSize() % pageSize_ + 1);
-          display += json_object_get_string(v);
+          if (cloud)
+            display += "☁";
+          auto text = std::string_view(json_object_get_string(v),
+                                       json_object_get_string_len(v));
+          const auto *emoticon =
+              wetype::WeChatEmoticons::isWeChat(ic->program())
+                  ? wechatEmoticons_.find(text)
+                  : nullptr;
+          if (emoticon && wechatFont_)
+            display += utf8::UCS4ToUTF8(emoticon->codepoint) + " ";
+          display += text;
           list->append<Word>(this, std::move(display), i, s->revision);
         }
       }
@@ -1679,13 +1946,45 @@ public:
                                    &instance_->userInterfaceManager());
     settingsConnection_ = settingsAction_.connect<SimpleAction::Activated>(
         [](InputContext *) { startProcess({WETYPE_SETTINGS}); });
+    // Fcitx's default AltTriggerKeys contains Shift_L and runs before the
+    // engine. Own enabled language modifiers here so unfinished input reaches
+    // our ordered raw-commit path rather than being reset by a global switch.
+    languageModifierWatcher_ = instance_->watchEvent(
+        EventType::InputContextKeyEvent, EventWatcherPhase::PreInputMethod,
+        [this](Event &event) {
+          auto &key = static_cast<KeyEvent &>(event);
+          const auto sym = key.key().sym();
+          const bool enabled =
+              ((sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) &&
+               *config_.shortcuts->shiftSwitch) ||
+              ((sym == FcitxKey_Control_L || sym == FcitxKey_Control_R) &&
+               *config_.shortcuts->ctrlSwitch);
+          // Leave multi-modifier shortcuts (e.g. Alt+Shift and the voice
+          // shortcut) to their normal handlers. Only own the bare modifier.
+          const auto otherModifiers =
+              key.key().states().toInteger() & uint32_t(KeyState::SimpleMask) &
+              ~Key::keySymToStates(sym).toInteger();
+          if (!enabled || key.filtered() || otherModifiers)
+            return;
+          auto *ic = key.inputContext();
+          auto *entry = instance_->inputMethodEntry(ic);
+          if (!entry || entry->uniqueName() != "wetypex" ||
+              !state(ic)->active ||
+              ic->capabilityFlags().test(CapabilityFlag::Password))
+            return;
+          keyEvent(*entry, key);
+          key.filterAndAccept();
+        });
     timer_ = instance_->eventLoop().addTimeEvent(
         CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 100000, 0,
         [this](auto *source, uint64_t time) {
           bool pending = false;
+          bool focused = false;
           for (auto &[id, ref] : contexts_)
             if (auto *ic = ref.get()) {
               auto *s = ic->propertyFor(&factory_);
+              focused |= s->active && ic->hasFocus() &&
+                         !ic->capabilityFlags().test(CapabilityFlag::Password);
               pending |= s->active && s->seq > s->applied;
               if (networkEnabled_ && ready_ && s->active && ic->hasFocus() &&
                   !s->preedit.empty() && s->seq == s->applied &&
@@ -1703,17 +2002,19 @@ public:
             if (!start())
               scheduleRestart();
           }
-          if (time >= syncTick_ + 1000000) {
+          if (time >= syncTick_ + (voicePending_ ? 40000 : 1000000)) {
             syncTick_ = time;
             receiveVoice();
           }
+          if (focused && networkEnabled_ && time >= voiceWarmTick_ + 60000000)
+            primeVoice();
           pollVModeWindow();
           if (networkEnabled_ && *config_.update->autoUpdate &&
               time >= updateTick_ + 3600000000ULL) {
             updateTick_ = time;
             startProcess({WETYPE_UPDATE});
           }
-          source->setTime(time + 100000);
+          source->setTime(time + (voicePending_ ? 40000 : 100000));
           source->setEnabled(true);
           return true;
         });
@@ -1749,6 +2050,7 @@ public:
     setConfig(raw);
   }
   void reloadConfig() override {
+    cancelVoice();
     reloadSettings();
     if (networkEnabled_)
       startSync();
@@ -1762,6 +2064,8 @@ public:
     }
   }
   ~WeType() override {
+    cancelVoice();
+    languageModifierWatcher_.reset();
     timer_.reset();
     stop();
     stopSync();
@@ -1774,6 +2078,20 @@ public:
       stopSync();
     auto *ic = e.inputContext();
     auto *current = state(ic);
+    if (vModeSession_ == current->id && current->vMode && vModeFocusDeadline_ &&
+        now(CLOCK_MONOTONIC) >= vModeFocusDeadline_)
+      cancelVMode(ic, "toolbar focus grace expired before activation");
+    if (vModeSession_ == current->id && current->vMode && current->active &&
+        !ic->capabilityFlags().test(CapabilityFlag::Password)) {
+      // The toolbar is still open after a focus round trip caused by the
+      // layer surface itself. Do not send "open" again: it would reset the
+      // backend V session the toolbar is still using.
+      current->active = true;
+      vModeFocusDeadline_ = 0;
+      ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
+      panel(ic, current);
+      return;
+    }
     current->active = true;
     current->english = *config_.input->defaultLanguage ==
                        wetype_config::DefaultLanguage::English;
@@ -1781,12 +2099,15 @@ public:
     ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
     if (ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    primeVoice();
     panel(ic, current);
     send(ic, "open");
   }
   void reset(const InputMethodEntry &, InputContextEvent &e) override {
     auto *ic = e.inputContext();
     auto *s = state(ic);
+    if (voicePending_ && voiceSession_ == s->id)
+      cancelVoice();
     if (vModeSession_ == s->id)
       stopVModeWindow(s->active ? "input context reset"
                                 : "input method deactivated");
@@ -1801,6 +2122,7 @@ public:
     s->pendingPairRight.clear();
     s->symbolAutoState = 0;
     s->vMode = false;
+    s->vCalculator = false;
     s->cloudPollUntil = 0;
     ic->inputPanel().reset();
     if (child_ > 0)
@@ -1810,7 +2132,19 @@ public:
   }
   void deactivate(const InputMethodEntry &entry,
                   InputContextEvent &e) override {
-    state(e.inputContext())->active = false;
+    auto *s = state(e.inputContext());
+    if (voiceSession_ == s->id)
+      cancelVoice();
+    if (e.type() == EventType::InputContextFocusOut && vModeSession_ == s->id &&
+        s->vMode && !vModeNative_ &&
+        instance_->lastFocusedInputContext() == nullptr) {
+      if (!vModeFocusDeadline_)
+        vModeFocusDeadline_ = now(CLOCK_MONOTONIC) + 500000;
+      std::ofstream log(stateDirectory() / "vmode.log", std::ios::app);
+      log << "V toolbar waiting up to 500ms for original input focus\n";
+      return;
+    }
+    s->active = false;
     reset(entry, e);
     if (child_ > 0)
       send(e.inputContext(), "close");
@@ -1830,6 +2164,7 @@ public:
       return;
     s->selectionPending = true;
     s->vMode = false;
+    s->vCalculator = false;
     ic->inputPanel().setCandidateList(nullptr);
     // Keep the current client preedit until the asynchronous select response
     // commits the chosen text.  Clearing it here races React/contenteditable
@@ -1880,6 +2215,14 @@ public:
     auto sym = key.sym();
     if (!s->active || ic->capabilityFlags().test(CapabilityFlag::Password))
       return;
+    if (networkEnabled_ && e.rawKey().states().test(KeyState::Repeat) &&
+        ((*config_.voice->launchShortcut &&
+          key.checkKeyList(*config_.voice->launchKey)) ||
+         (*config_.voice->holdShortcut &&
+          key.checkKeyList(*config_.voice->holdKey)))) {
+      e.filterAndAccept();
+      return;
+    }
     // A later key must not operate on the preedit awaiting a select reply.
     // Re-enter normal event processing after that reply has committed it.
     if (s->selectionPending && sym != FcitxKey_Escape) {
@@ -1895,7 +2238,7 @@ public:
     if (e.isRelease()) {
       auto releasedConfiguredKey = [&](const KeyList &keys) {
         return std::any_of(keys.begin(), keys.end(), [&](const Key &candidate) {
-          return key.isReleaseOfModifier(candidate);
+          return sym == candidate.sym() || key.isReleaseOfModifier(candidate);
         });
       };
       if (voiceRecording_ && voiceHold_ &&
@@ -1928,11 +2271,32 @@ public:
            configuredLanguageSwitch)) {
         if (s->vMode)
           cancelVMode(ic);
-        if (!s->preedit.empty())
-          send(ic, "reset");
-        s->preedit.clear();
-        s->cursor = 0;
-        clearDisplayState(s);
+        // Preserve unfinished pinyin when Shift switches to English. The
+        // backend receives this after earlier key requests and retains their
+        // literal text, even before Fcitx receives the latest preedit reply.
+        if (!s->preedit.empty() || s->inputSeq > s->applied) {
+          if (send(ic, "raw")) {
+            // Keep the current preedit visible until the asynchronous raw
+            // commit arrives, and queue later keys behind that commit.
+            s->selectionPending = true;
+            ic->inputPanel().setCandidateList(nullptr);
+          } else {
+            // If the backend cannot be started, do not discard the text we
+            // still have locally. Ignore any late replies from that session.
+            if (!s->preedit.empty())
+              ic->commitString(s->preedit);
+            ++s->epoch;
+            s->selectionPending = false;
+            s->deferredKeys.clear();
+            s->preedit.clear();
+            s->cursor = 0;
+            clearDisplayState(s);
+          }
+        } else {
+          s->preedit.clear();
+          s->cursor = 0;
+          clearDisplayState(s);
+        }
         s->english = !s->english;
         s->symbolAutoState = 0;
         s->modifierCandidate = FcitxKey_None;
@@ -1944,23 +2308,38 @@ public:
     }
     if (networkEnabled_ && *config_.voice->launchShortcut &&
         key.checkKeyList(*config_.voice->launchKey)) {
-      if (!voiceRecording_)
-        startVoice(ic, false);
-      else
+      if (voiceRecording_ && voiceHold_)
         voiceHold_ = false;
+      else if (voicePending_)
+        stopVoice(!voiceRecording_);
+      else if (!flushBeforeVoice(ic, e))
+        startVoice(ic, false);
       e.filterAndAccept();
       return;
     }
-    if (networkEnabled_ && !voiceRecording_ && *config_.voice->holdShortcut &&
+    if (networkEnabled_ && *config_.voice->holdShortcut &&
         key.checkKeyList(*config_.voice->holdKey)) {
-      startVoice(ic, true);
+      if (!voicePending_ && !flushBeforeVoice(ic, e))
+        startVoice(ic, true);
       e.filterAndAccept();
       return;
     }
-    if (voiceRecording_ && !key.isModifier()) {
-      stopVoice();
-      e.filterAndAccept();
-      return;
+    if (voicePending_ && !key.isModifier()) {
+      if (sym == FcitxKey_Escape) {
+        cancelVoice();
+        e.filterAndAccept();
+        return;
+      }
+      if (!key.states() &&
+          (sym == FcitxKey_space || sym == FcitxKey_Return ||
+           sym == FcitxKey_KP_Enter)) {
+        stopVoice(sym != FcitxKey_space || !voiceRecording_);
+        e.filterAndAccept();
+        return;
+      }
+      // Keep the first typed key and application shortcuts when the user
+      // leaves dictation, instead of silently swallowing them.
+      cancelVoice();
     }
     if (key.isModifier()) {
       s->modifierCandidate = sym;
@@ -2128,6 +2507,7 @@ public:
       send(ic, "key", "v");
       send(ic, "vmode");
       s->vMode = true;
+      s->vCalculator = false;
       s->preedit.clear();
       s->cursor = 0;
       clearDisplayState(s);
@@ -2368,8 +2748,10 @@ public:
       s->preedit.insert(s->cursor, text);
       ++s->cursor;
       clearDisplayState(s);
+      // Cloud replies are asynchronous and can lag well behind a keystroke.
+      // Keep refreshing the merged list while the composition stays open.
       if ((lower || upper) && networkEnabled_)
-        s->cloudPollUntil = now(CLOCK_MONOTONIC) + 1500000;
+        s->cloudPollUntil = now(CLOCK_MONOTONIC) + 8000000;
       send(ic, "key", text);
       panel(ic, s);
       e.filterAndAccept();

@@ -2,7 +2,7 @@
 
 pkgname=fcitx5-wetypex
 pkgver=2.2.3.657
-pkgrel=10
+pkgrel=13
 pkgdesc="Native Linux compatibility layer for WeType on Fcitx5"
 arch=('x86_64')
 url="https://github.com/panxuc/fcitx5-wetypex"
@@ -19,6 +19,10 @@ depends=(
     'bubblewrap'
     'util-linux'
     'python'
+    'python-fonttools'
+    'python-pillow'
+    'fontconfig'
+    'wayland'
     'qt6-base'
     'qt6-svg'
     'qt6-webengine'

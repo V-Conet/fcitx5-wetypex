@@ -2,6 +2,7 @@
 // thread.
 #include "../common/wechat_emoticons.hpp"
 #include "control.hpp"
+#include <thread>
 static const wetype::WeChatEmoticons &service_emoticons() {
   static const wetype::WeChatEmoticons data(
       std::filesystem::path(getenv("WETYPE_SUPPORT_DIR")
@@ -66,6 +67,10 @@ struct ServiceCandidate {
 };
 struct ServiceSession {
   uint64_t engine = 0, revision = 0;
+  uint64_t sequence = 0, epoch = 0, update = 0, sentUpdate = 0;
+  ServiceTransport *transport = nullptr;
+  const std::thread::id serviceThread = std::this_thread::get_id();
+  bool predicting = false;
   uint32_t keyboard = 0;
   std::string preedit, selected;
   size_t cursor = 0;
@@ -123,7 +128,7 @@ static void read_service_candidates(void *iterator,
                                     std::vector<ServiceCandidate> &output,
                                     bool wechat) {
   output.clear();
-  for (unsigned rank = 0; iterator && rank < 50; rank++) {
+  for (unsigned rank = 0; iterator && rank < 50 && output.size() < 50; rank++) {
     alignas(16) unsigned char c[512]{};
     if (!((bool (*)(void *, void *))syms.at("_wxime_candidate_next"))(iterator,
                                                                       c))
@@ -153,7 +158,40 @@ static void read_service_candidates(void *iterator,
     candidate.cloud = marker == 0xfffd && origin == 11000;
     if (id && n)
       candidate.id.assign(id, id + n);
-    output.push_back(std::move(candidate));
+    // Calendar candidates carry their display formats as linked C API info
+    // nodes, not in the base word (which remains "日期" or "时间").
+    // NewAndCopyCandidateInfoToCStruct: type +0, next +8; TimeFormat (9)
+    // stores UTF-8 text +16 and its byte count +24.
+    const void *info = nullptr;
+    memcpy(&info, c + 0x30, sizeof(info));
+    const auto formatBegin = output.size();
+    bool expanded = false;
+    for (unsigned count = 0; info && count < 128; ++count) {
+      const auto *node = static_cast<const unsigned char *>(info);
+      uint32_t type = 0, length = 0;
+      const char *value = nullptr;
+      memcpy(&type, node, sizeof(type));
+      if (type == 9 && output.size() < 50) {
+        memcpy(&value, node + 16, sizeof(value));
+        memcpy(&length, node + 24, sizeof(length));
+        if (length > 65536 || (!value && length))
+          _exit(89);
+        if (length) {
+          auto formatted = candidate;
+          formatted.text.assign(value, length);
+          formatted.engineText = formatted.text;
+          output.push_back(std::move(formatted));
+          expanded = true;
+        }
+      }
+      memcpy(&info, node + 8, sizeof(info));
+    }
+    if (expanded) {
+      // Date/time shortcuts lead the list even when learned ordinary words
+      // precede the calendar record. Keep those words selectable afterwards.
+      std::rotate(output.begin(), output.begin() + formatBegin, output.end());
+    } else
+      output.push_back(std::move(candidate));
   }
 }
 static void service_listener(uint64_t, int32_t *types, void **payloads,
@@ -162,11 +200,13 @@ static void service_listener(uint64_t, int32_t *types, void **payloads,
   if (count > 64 || (!types && count) || (!payloads && count))
     _exit(89);
   std::lock_guard<std::mutex> guard(s.mutex);
+  bool changed = false;
   for (unsigned i = 0; i < count; i++) {
     // An empty PendingInput list is represented by a null head pointer.
     if (!payloads[i] && types[i] != 5)
       continue;
     if (types[i] == 0) {
+      changed = true;
       // CCallbackHolder::ParseEvent: iterator +0, kind +8,
       // cloud iterator +16, version +24 (macOS 2.2.3.657).
       auto it = *(void **)payloads[i];
@@ -178,6 +218,7 @@ static void service_listener(uint64_t, int32_t *types, void **payloads,
       if (cloud && cloud != it)
         ((void (*)(void *))syms.at("_wxime_delete_candidate_iterator"))(cloud);
     } else if (types[i] == 6) {
+      changed = true;
       // _wxime_cloud_result_event: iterator +0, kind +8, version +24.
       // The iterator is the engine's fully merged list; cloud entries are
       // identified by their struct marker in read_service_candidates.
@@ -190,11 +231,13 @@ static void service_listener(uint64_t, int32_t *types, void **payloads,
       const char *text = *(const char **)payloads[i];
       uint32_t n = *(uint32_t *)((char *)payloads[i] + 8);
       if (text && n < 65536) {
+        changed = true;
         s.commits.emplace_back(
             service_emoticons().commit(std::string(text, n), s.wechatEmoji));
         s.selected.clear();
       }
     } else if (types[i] == 5) {
+      changed = true;
       // CCallbackHolder::sigPendingInputUpdated emits event 5.  Its payload is
       // the head pointer of PendingInput's singly-linked list; each node keeps
       // the next pointer at +8.  Count it while the callback owns the list.
@@ -249,6 +292,12 @@ static void service_listener(uint64_t, int32_t *types, void **payloads,
       s.displayCursor = hasCursor ? displayCursor : s.displayPreedit.size();
       s.cursorStops = std::move(stops);
     }
+  }
+  if (changed) {
+    ++s.update;
+    // Synchronous callbacks are already included in the current reply.
+    if (s.transport && std::this_thread::get_id() != s.serviceThread)
+      s.transport->notify();
   }
 }
 static bool service_select(ServiceSession &s, unsigned rank,
@@ -317,15 +366,84 @@ static bool service_select(ServiceSession &s, unsigned rank,
   }
   return true;
 }
+// Caller holds the session mutex; normal replies and callback updates share
+// the same snapshot and candidate IDs. Commits are drained exactly once.
+static void service_snapshot(ServiceSession &s, json_object *response) {
+  // PendingInput entries can combine letters (e.g. "zh"). Their
+  // count is not the number of typed ASCII bytes.
+  if (!s.pending && (!s.keyboard || !s.commits.empty())) {
+    s.preedit.clear();
+    s.selected.clear();
+    s.cursor = 0;
+    s.pendingRaw.clear();
+    s.displayPreedit.clear();
+    s.displayCursor = 0;
+    s.cursorStops.clear();
+  }
+  if (!s.vMode && s.preedit.empty() && s.selected.empty() &&
+      !s.predicting && !s.candidates.empty()) {
+    s.candidates.clear();
+    s.published.clear();
+    ++s.revision;
+  }
+  publish_service_candidates(s);
+  wire::put(response, "revision", int64_t(s.revision));
+  wire::put(response, "preedit", s.selected + s.preedit);
+  wire::put(response, "cursor",
+            int64_t(s.selected.size() + s.cursor));
+  wire::put(response, "editable_begin", int64_t(s.selected.size()));
+  if (s.pendingRaw == s.selected + s.preedit) {
+    wire::put(response, "display_preedit", s.displayPreedit);
+    wire::put(response, "display_cursor", int64_t(s.displayCursor));
+    auto *stops = json_object_new_array();
+    for (auto stop : s.cursorStops)
+      json_object_array_add(stops, json_object_new_int64(stop));
+    json_object_object_add(response, "cursor_stops", stops);
+  }
+  auto *array = json_object_new_array();
+  for (auto &c : s.candidates)
+    json_object_array_add(
+        array, json_object_new_string_len(c.text.data(), c.text.size()));
+  json_object_object_add(response, "candidates", array);
+  array = json_object_new_array();
+  for (auto &c : s.candidates)
+    json_object_array_add(array, json_object_new_boolean(c.cloud));
+  json_object_object_add(response, "cloud", array);
+  array = json_object_new_array();
+  for (auto &c : s.commits)
+    json_object_array_add(array,
+                          json_object_new_string_len(c.data(), c.size()));
+  json_object_object_add(response, "commits", array);
+  wire::put(response, "update_id", int64_t(s.update));
+  s.sentUpdate = s.update;
+  s.commits.clear();
+}
 static void service_loop() {
-  std::map<uint64_t, std::unique_ptr<ServiceSession>> sessions;
   ServiceTransport transport;
-  puts("{\"event\":\"ready\",\"protocol\":1,\"backend\":\"original-wetype-"
-       "native\"}");
+  std::map<uint64_t, std::unique_ptr<ServiceSession>> sessions;
+  printf("{\"event\":\"ready\",\"protocol\":1,\"backend\":\"original-wetype-"
+         "native\",\"candidate_updates\":%s}\n",
+         transport.supportsUpdates() ? "true" : "false");
   fflush(stdout);
   std::string line;
   int source = 0;
   while (transport.next(line, source)) {
+    if (source < 0) {
+      for (auto &[client, state] : sessions) {
+        auto &s = *state;
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.transport || !s.sequence || s.update == s.sentUpdate)
+          continue;
+        auto response = wire::object();
+        wire::put(response.get(), "event", std::string("update"));
+        wire::put(response.get(), "session", int64_t(client));
+        wire::put(response.get(), "seq", int64_t(s.sequence));
+        wire::put(response.get(), "epoch", int64_t(s.epoch));
+        service_snapshot(s, response.get());
+        transport.reply(STDIN_FILENO, wire::dump(response.get()));
+      }
+      continue;
+    }
     if (line.size() > 65536)
       _exit(90);
     auto request = wire::parse(line);
@@ -408,6 +526,11 @@ static void service_loop() {
           continue;
         }
         auto state = std::make_unique<ServiceSession>();
+        // Older frontends only understand request replies. Do not drain an
+        // asynchronous commit into a pushed message they would discard.
+        if (transport.supportsUpdates() &&
+            wire::number(request.get(), "candidate_updates", 0))
+          state->transport = &transport;
         state->wechatEmoji =
             service_emoticons().ready() &&
             wire::number(request.get(), "emoji_recommend", 1) &&
@@ -427,6 +550,14 @@ static void service_loop() {
         // enum (86/98/New Century).
         uint32_t wubiSolution = std::clamp<int>(
             wire::number(request.get(), "wubi_solution", 0), 0, 2);
+        if (keyboard == 5 &&
+            (!wubiDictionaryAvailable[wubiSolution] ||
+             !configure_wubi_dictionary(wubiSolution))) {
+          wire::put(response.get(), "error",
+                    std::string("selected Wubi dictionary is unavailable"));
+          transport.reply(source, wire::dump(response.get()));
+          continue;
+        }
         memcpy(config + 0x24, &wubiSolution, sizeof(wubiSolution));
         config[0x28] = wire::number(request.get(), "wubi_pinyin", 0);
         config[0x29] = wire::number(request.get(), "wubi_unique_commit", 0);
@@ -467,6 +598,8 @@ static void service_loop() {
         // SessionCreator gates construction of VModeV2 on config +0x125.
         // The UI later activates that wrapper with session bool option 0x11.
         config[0x125] = wire::number(request.get(), "v_mode", 1);
+        // Calendar::Impl enables the original English date/time aliases.
+        config[0x127] = 1;
         *(uint32_t *)(config + 0xb8) =
             wire::number(request.get(), "traditional", 0) ? 1 : 0;
         state->keyboard = keyboard;
@@ -480,6 +613,9 @@ static void service_loop() {
         sessions[client] = std::move(state);
       }
       auto &s = *sessions.at(client);
+      s.sequence = seq;
+      s.epoch = epoch;
+      s.predicting = op == "predict";
       if (op == "select" && wire::number(request.get(), "revision", -1) < 0 &&
           wire::number(request.get(), "index") == 0) {
         std::lock_guard<std::mutex> lock(s.mutex);
@@ -637,57 +773,12 @@ static void service_loop() {
         wire::put(response.get(), "error", std::string("unknown operation"));
       {
         std::lock_guard<std::mutex> lock(s.mutex);
-        // PendingInput entries can combine letters (e.g. "zh"). Their
-        // count is not the number of typed ASCII bytes.
-        if (!s.pending && (!s.keyboard || !s.commits.empty())) {
-          s.preedit.clear();
-          s.selected.clear();
-          s.cursor = 0;
-          s.pendingRaw.clear();
-          s.displayPreedit.clear();
-          s.displayCursor = 0;
-          s.cursorStops.clear();
-        }
-        if (!s.vMode && s.preedit.empty() && s.selected.empty() &&
-            op != "predict" && !s.candidates.empty()) {
-          s.candidates.clear();
-          s.published.clear();
-          ++s.revision;
-        }
-        publish_service_candidates(s);
-        wire::put(response.get(), "revision", int64_t(s.revision));
-        wire::put(response.get(), "preedit", s.selected + s.preedit);
-        wire::put(response.get(), "cursor",
-                  int64_t(s.selected.size() + s.cursor));
-        wire::put(response.get(), "editable_begin", int64_t(s.selected.size()));
-        if (s.pendingRaw == s.selected + s.preedit) {
-          wire::put(response.get(), "display_preedit", s.displayPreedit);
-          wire::put(response.get(), "display_cursor", int64_t(s.displayCursor));
-          auto *stops = json_object_new_array();
-          for (auto stop : s.cursorStops)
-            json_object_array_add(stops, json_object_new_int64(stop));
-          json_object_object_add(response.get(), "cursor_stops", stops);
-        }
-        auto *array = json_object_new_array();
-        for (auto &c : s.candidates)
-          json_object_array_add(
-              array, json_object_new_string_len(c.text.data(), c.text.size()));
-        json_object_object_add(response.get(), "candidates", array);
-        array = json_object_new_array();
-        for (auto &c : s.candidates)
-          json_object_array_add(array, json_object_new_boolean(c.cloud));
-        json_object_object_add(response.get(), "cloud", array);
-        array = json_object_new_array();
-        for (auto &c : s.commits)
-          json_object_array_add(array,
-                                json_object_new_string_len(c.data(), c.size()));
-        json_object_object_add(response.get(), "commits", array);
+        service_snapshot(s, response.get());
         if (!cursorCommit.empty()) {
           wire::put(response.get(), "cursor_commit", cursorCommit);
           wire::put(response.get(), "cursor_commit_position",
                     cursorCommitPosition);
         }
-        s.commits.clear();
       }
     }
     transport.reply(source, wire::dump(response.get()));

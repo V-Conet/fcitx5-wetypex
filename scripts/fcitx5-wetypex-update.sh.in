@@ -101,14 +101,21 @@ def notify_and_offer_install(package, version, family):
     notify = shutil.which("notify-send")
     if not notify:
         return
+    try:
+        help_result = subprocess.run([notify, "--help"], capture_output=True,
+                                     timeout=3)
+        actions = help_result.returncode == 0 and b"--action" in (
+            help_result.stdout + help_result.stderr)
+    except (OSError, subprocess.TimeoutExpired):
+        return
     command = [
         notify,
         "--app-name=WeTypeX",
         "--icon=fcitx5-wetypex",
-        "--action=install=安装更新",
-        f"WeTypeX {version} 已下载",
-        f"已校验软件包：{package.name}",
     ]
+    if actions:
+        command += ["--action=install=安装更新"]
+    command += [f"WeTypeX {version} 已下载", f"已校验软件包：{package}"]
     try:
         selected = subprocess.run(command, capture_output=True, text=True).stdout.strip()
     except OSError:

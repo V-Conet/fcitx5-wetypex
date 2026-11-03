@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <deque>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -511,7 +512,7 @@ static bool run_flurry_loopback_test() {
   // the operating system owns final teardown of the two short-lived peers.
   return passed;
 }
-static int run_flurry_server() {
+static int run_flurry_server(const std::string &initialCommand = {}) {
   const char *download = getenv("WETYPE_FLURRY_DOWNLOAD_DIR");
   const char *temporary = getenv("WETYPE_FLURRY_TEMP_DIR");
   if (!download || !*download || !temporary || !*temporary) {
@@ -559,20 +560,24 @@ static int run_flurry_server() {
               "19UploadDirectoryInfoEm"));
   FlurryLiveDelegate delegate;
   alignas(16) unsigned char server[32]{};
-  constructor(server, download, temporary, &delegate, 0);
+  // We advertise capability 0x2 (range ACK support). Match that promise for
+  // direct transfers too, otherwise the peer can report failure after saving.
+  constructor(server, download, temporary, &delegate, 1);
   auto ready = wire::object();
   wire::put(ready.get(), "event", "ready");
   wire::put(ready.get(), "port", int64_t(port));
   wire::put(ready.get(), "ca_cert", flurry_ca_cert);
   wire::put(ready.get(), "server_name", flurry_server_name);
-  puts(wire::dump(ready.get()).c_str());
-  fflush(stdout);
+  if (initialCommand.empty()) {
+    puts(wire::dump(ready.get()).c_str());
+    fflush(stdout);
+  }
   if (const char *ready_path = getenv("WETYPE_FLURRY_READY_FILE")) {
     std::ofstream output(ready_path, std::ios::trunc);
     output << wire::dump(ready.get()) << '\n';
   }
-  std::string command;
-  if (!std::getline(std::cin, command))
+  std::string command = initialCommand;
+  if (command.empty() && !std::getline(std::cin, command))
     return 2;
   auto role = wire::parse(command);
   const auto action = wire::str(role.get(), "action");
@@ -601,6 +606,8 @@ static int run_flurry_server() {
     return 2;
   }
   emit_flurry_event("role_started");
+  if (!initialCommand.empty())
+    emit_flurry_grpc_ready(port);
   while (std::getline(std::cin, command)) {
     auto request = wire::parse(command);
     const auto request_action = wire::str(request.get(), "action");
@@ -623,28 +630,43 @@ static int run_flurry_server() {
       upload_files(server, &file, 1);
       continue;
     }
-    std::filesystem::path root(path);
+    std::error_code traversal_error;
+    auto root =
+        std::filesystem::absolute(path, traversal_error).lexically_normal();
+    if (root.filename().empty() && root != root.root_path())
+      root = root.parent_path();
     const auto root_name = root.filename().string();
+    if (traversal_error || root_name.empty()) {
+      emit_flurry_event("read_error", path.c_str(), 0, 0,
+                        int(FlurryStatusCode::FilesystemFailed),
+                        "请选择一个普通文件夹");
+      continue;
+    }
     std::vector<std::string> file_paths, file_relatives, directory_paths,
         directory_relatives;
     directory_paths.push_back(root.string());
     directory_relatives.push_back(root_name);
-    std::error_code traversal_error;
     for (std::filesystem::recursive_directory_iterator
              iterator(root, traversal_error),
          end;
          !traversal_error && iterator != end;
          iterator.increment(traversal_error)) {
-      auto relative =
-          (std::filesystem::path(root_name) /
-           std::filesystem::relative(iterator->path(), root, traversal_error))
-              .generic_string();
+      const auto type = iterator->symlink_status(traversal_error);
       if (traversal_error)
         break;
-      if (iterator->is_directory()) {
+      if (!std::filesystem::is_directory(type) &&
+          !std::filesystem::is_regular_file(type)) {
+        traversal_error =
+            std::make_error_code(std::errc::operation_not_supported);
+        break;
+      }
+      auto relative = (std::filesystem::path(root_name) /
+                       iterator->path().lexically_relative(root))
+                          .generic_string();
+      if (std::filesystem::is_directory(type)) {
         directory_paths.push_back(iterator->path().string());
         directory_relatives.push_back(std::move(relative));
-      } else if (iterator->is_regular_file()) {
+      } else {
         file_paths.push_back(iterator->path().string());
         file_relatives.push_back(std::move(relative));
       }
@@ -652,7 +674,9 @@ static int run_flurry_server() {
     if (traversal_error) {
       emit_flurry_event("read_error", path.c_str(), 0, 0,
                         int(FlurryStatusCode::FilesystemFailed),
-                        traversal_error.message().c_str());
+                        traversal_error == std::errc::operation_not_supported
+                            ? "目录包含符号链接或其他不支持的文件类型"
+                            : traversal_error.message().c_str());
       continue;
     }
     std::vector<FlurryUploadFileInfo> files;
@@ -720,6 +744,11 @@ static int run_flurry_wxp2p_server() {
       const auto action = wire::str(request.get(), "action");
       if (action == "quit")
         _exit(0);
+      // A paired sender can offer direct gRPC without WXP2P dispatch. Keep
+      // this process and its already-published certificate when taking that
+      // path.
+      if (action == "server")
+        return run_flurry_server(pendingCommand);
       if (action == "wxp2p_start") {
         dispatchPath = wire::str(request.get(), "dispatch_path");
         remoteCaPath = wire::str(request.get(), "remote_ca_file");
@@ -2618,6 +2647,38 @@ static void engine_log(int level, const char *s) {
     fprintf(stderr, "IME[%d] %s\n", level, s ? s : "(null)");
 }
 #include "business_services.hpp"
+// The pinned C ABI has a 24-byte entry: an optional FD descriptor, path,
+// type and version. It has no uniqueID field. Only one table for each type
+// can be registered; the three Wubi tables all use type 524291.
+struct NativeDict {
+  void *asset;
+  const char *path;
+  uint32_t id, version;
+};
+struct NativeDictConfig {
+  NativeDict *dicts;
+  uint32_t count, padding;
+  const char *user_path;
+};
+static_assert(sizeof(NativeDict) == 24 && sizeof(NativeDictConfig) == 24);
+static std::deque<std::string> dictionaryPaths;
+static std::array<std::vector<NativeDict>, 3> dictionarySets;
+static std::array<bool, 3> wubiDictionaryAvailable{};
+static int configuredWubiDictionary = -1;
+static bool configure_wubi_dictionary(unsigned solution) {
+  if (solution >= dictionarySets.size())
+    return false;
+  if (configuredWubiDictionary == int(solution))
+    return true;
+  auto &dicts = dictionarySets[solution];
+  NativeDictConfig config{dicts.data(), uint32_t(dicts.size()), 0,
+                          "/work/userDict"};
+  const bool loaded =
+      ((bool (*)(const NativeDictConfig *))syms.at("_wxime_config_dict"))(&config);
+  if (loaded)
+    configuredWubiDictionary = int(solution);
+  return loaded;
+}
 #include "service.hpp"
 struct LlmResultItem {
   const unsigned char *data;
@@ -3164,21 +3225,6 @@ int main(int argc, char **argv) {
   }
   if (mode == "serve" && getenv("WETYPE_NETWORK_LIVE"))
     network_login_service(false, false, false);
-  struct Dict {
-    void *asset;
-    const char *path;
-    uint32_t id, version;
-  };
-  struct DictConfig {
-    Dict *dicts;
-    uint32_t count;
-    uint32_t padding;
-    const char *user_path;
-  };
-  static_assert(sizeof(Dict) == 24 && sizeof(DictConfig) == 24);
-  std::vector<std::string> paths;
-  paths.reserve(100);
-  std::vector<Dict> dicts;
   std::ifstream dictfile(dir + "/dicts.txt");
   while (std::getline(dictfile, line)) {
     std::istringstream s(line);
@@ -3187,13 +3233,20 @@ int main(int argc, char **argv) {
     s >> id >> version >> name;
     if (name.empty())
       continue;
-    paths.push_back("/input/resources/" + name);
-    dicts.push_back({nullptr, paths.back().c_str(), id, version});
+    dictionaryPaths.push_back("/input/resources/" + name);
+    static const std::array<std::string, 3> wubiNames{
+        "swbd86.bin", "swbd98.bin", "swbdnc.bin"};
+    for (unsigned solution = 0; solution < dictionarySets.size(); ++solution) {
+      if (id == 524291 && name != wubiNames[solution])
+        continue;
+      if (id == 524291)
+        wubiDictionaryAvailable[solution] = true;
+      dictionarySets[solution].push_back(
+          {nullptr, dictionaryPaths.back().c_str(), id, version});
+    }
   }
-  DictConfig dc{dicts.data(), (uint32_t)dicts.size(), 0, "/work/userDict"};
-  fprintf(stderr, "CALL wxime_config_dict count=%u\n", dc.count);
-  bool loaded =
-      ((bool (*)(const DictConfig *))syms.at("_wxime_config_dict"))(&dc);
+  fprintf(stderr, "CALL wxime_config_dict count=%zu\n", dictionarySets[0].size());
+  bool loaded = configure_wubi_dictionary(0);
   fprintf(stderr, "WXIME_CONFIG_DICT_RETURNED %d\n", loaded);
   if (!loaded)
     _exit(88);

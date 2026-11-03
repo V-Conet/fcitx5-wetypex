@@ -21,6 +21,8 @@ packaging/build-packages.sh
 
 标准 deb 使用 Jammy 的 Qt5、Fcitx5 5.0.14 和 glibc 2.35 构建；legacy deb 以 Focal 的 Qt5.12、glibc 2.31 构建，并要求稳定版 Fcitx5 5.0.14+、fcitx5-qt 5.0.10+ 和 LibIME 1.0.11+。Focal 的原生预览框架 ABI 不兼容，构建镜像使用固定上游提交生成 SDK，发行包不捆绑或替换用户的 Fcitx5 框架。
 
+运行时启动也兼容 Focal 的 Bubblewrap 0.4：在启动沙箱前清空环境，再显式传入所需变量，覆盖核心、账号、AI、语音和首次校验流程。旧版 `notify-send` 没有操作按钮时使用普通更新通知。排查旧系统时应实际运行 `fcitx5-wetypex-setup --check` 和输入、语音流程，编译成功不能证明这些辅助命令可用。
+
 Fcitx5 输入插件和 Qt5/Qt6 配置插件采用 `FCITX_INSTALL_ADDONDIR`；私有引擎宿主继续位于 `/usr/lib/fcitx5-wetypex`。配置工具会在 `qt5` 或 `qt6` 子目录加载对应 ABI 的插件。Qt6 不完整时，源码构建会使用 Qt5.12+，可通过 `WETYPE_QT_VERSION` 指定。
 
 网络桥接默认静态包含固定版本 libcurl，启用 WS/WSS、OpenSSL 和线程 DNS 解析，避免发行版关闭 WebSocket 功能导致运行时失败。curl 源码版本与 SHA-256 固定在 `cmake/BundledCurl.cmake` 和 Arch 构建文件中，更新时应同步维护。可用 `-DWETYPE_BUNDLED_CURL=OFF` 选择系统 libcurl 8.9+，还需确认其构建启用了 WS/WSS。

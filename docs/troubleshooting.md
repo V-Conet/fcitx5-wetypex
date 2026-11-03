@@ -63,15 +63,18 @@ Ubuntu 20.04 使用 legacy 包，且必须先具备稳定版 Fcitx5 5.0.14+、fc
 
 ## 语音没有识别结果
 
-Ubuntu 20.04 自带 PipeWire 0.2，语音录制需要升级到提供 `pw-record` 的新版 PipeWire。文字输入和账户网络功能可独立使用。
+Ubuntu 22.04 的 `pw-record` 0.3.48 不支持 `--raw` 和 `--properties`。辅助程序会检测实际选项，旧版或缺少 `pw-record` 时自动使用 `parec`，再回退到 FFmpeg 的 PulseAudio 输入；也支持 pipewire-pulse。已有系统可继续使用现有音频服务。
 
-先验证默认输入设备：
+根据当前音频服务选择一条命令，验证默认输入设备：
 
 ```bash
+# PipeWire
 pw-record --rate 16000 --channels 1 --format s16 /tmp/wetypex-test.wav
+# PulseAudio / pipewire-pulse
+parec --file-format=wav --rate=16000 --channels=1 --format=s16le > /tmp/wetypex-test.wav
 ```
 
-录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后运行 `fcitx5-wetypex-voice status`，检查 `native_ready`、`vad`、`state` 和时间字段。录音错误见 `state/voice/capture.log`，原版宿主错误见 `state/voice/backend.log`。识别需要联网；首次使用会初始化设备身份。编码和分块由原版引擎完成，FFmpeg 仅用于已有音频文件的解码。原版 VAD 模型可用 `--icons-only` 更新，具体操作见[流式语音输入](voice-input.md)。
+录制几秒后按 `Ctrl+C`，确认 WAV 非空。随后运行 `fcitx5-wetypex-voice status`，检查 `capture_backend`、`native_ready`、`vad`、`state` 和时间字段。录音错误见 `state/voice/capture.log`，原版宿主错误见 `state/voice/backend.log`。识别需要联网；首次使用会初始化设备身份。编码和分块由原版引擎完成，FFmpeg 用于已有音频解码以及缺少 `parec` 时的旧音频接口采集。原版 VAD 模型可用 `--icons-only` 更新，具体操作见[流式语音输入](voice-input.md)。
 
 ## 输入框周期性失焦，候选框消失并留下拼音
 
@@ -88,6 +91,16 @@ wl-copy --version
 ```
 
 升级后需要让旧的 `fcitx5-wetypex-syncd` 进程退出并启动新版本。KDE Wayland 可保存工作后注销并重新登录；只重新加载配置不一定会替换仍在运行的旧同步进程。重新测试时，在浏览器或编辑器中输入拼音、等待至少 10 秒，确认焦点和候选框保持。
+
+## 首次输入先出现拼音小框，再扩展成候选面板
+
+“拼音显示位置”设为“候选框内”，或应用不支持内嵌预编辑时，乐观更新的拼音可能早于本地候选，造成首次窗口先小后大的跳变。
+
+首次面板现在由本地核心回复触发，候选一到立即显示；输入框内的预编辑仍即时更新。核心慢于约一帧时显示组合文字兜底，后续按键不会延长这段等待。取消、失焦、切换模式或重启核心会清除等待状态。
+
+云候选由核心回调主动推送，不再等 100ms 轮询，也不会阻塞本地候选。兼容不支持推送的旧版辅助核心时保留轮询。冷启动还会受到字体、主题和桌面首次绘制耗时影响。
+
+排查时可在真实编辑器中对比首次输入、连续输入、Esc、失焦，以及“输入框内”和“候选框内”两种位置；窗口尺寸变化和按键到首次显示的耗时应分开观察。
 
 ## Electron 在 Wayland 下候选框固定在左上角
 
@@ -135,6 +148,10 @@ Qt WebEngine 无法启动时，检查 `qt6-webengine`、图形驱动和桌面沙
 
 ## 隔空传送无法连接
 
+接收关联设备主动发送的文件时，保持“隔空传送”窗口打开，并在邀请提示中选择“接收”。设备列表会自动加载，也可以选中设备后主动连接。只有当前账户的关联设备邀请会显示；已处理的邀请在本地记录，重新打开窗口不会反复提示同一次邀请。
+
+接收文件保存在系统“下载”目录下的 `WeTypeX` 文件夹，可点“打开接收目录”查看。传完后点“返回”可继续等待另一台设备；对方取消、拒绝或邀请过期时也会恢复等待状态。目录传输支持普通文件和目录，保留中文名称与空目录，不跟随符号链接。
+
 先运行：
 
 ```bash
@@ -148,6 +165,12 @@ fcitx5-wetypex-setup --check
 ```bash
 fcitx5-wetypex-setup --archive /path/to/WeType_2.2.3_657.zip --icons-only
 ```
+
+## Qt5 设置窗口偏小
+
+Qt5 的设置、AI、隔空传送和 V 工具窗口会在创建应用前启用系统 DPI 缩放及高分辨率图标，适用于 X11 分数缩放桌面。Qt6 沿用框架自己的缩放机制。显式设置的 Qt 缩放环境变量继续生效；例如 `QT_ENABLE_HIGHDPI_SCALING=0` 会关闭 Qt5 的自动缩放。
+
+候选窗由 Fcitx5 Classic UI 独立缩放，不依赖上述窗口设置。
 
 ## 重新配对
 

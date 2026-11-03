@@ -182,13 +182,13 @@ def validate_runtime(target):
                  '--ro-bind','/lib64','/lib64','--symlink','usr/bin','/bin',
                  '--proc','/proc','--dev','/dev','--tmpfs','/tmp',
                  '--ro-bind',str(target),'/input','--ro-bind',str(support),'/support',
-                 '--bind',work,'/work','--chdir','/work','--clearenv',
+                 '--bind',work,'/work','--chdir','/work',
                  '--setenv','PATH','/usr/bin','--setenv','HOME','/work',
                  '--setenv','WETYPE_SUPPORT_DIR','/support',
                  '/support/wetypex-engine-host','/input','validate']
         try:
             result=subprocess.run(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,timeout=20)
+                                  stderr=subprocess.PIPE,timeout=20,env={})
         except subprocess.TimeoutExpired:
             return False,'engine validation timed out'
         if result.returncode:
@@ -198,7 +198,7 @@ def validate_runtime(target):
         try:
             transfer=subprocess.run(transfer_command,stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE,timeout=20)
+                                    stderr=subprocess.PIPE,timeout=20,env={})
         except subprocess.TimeoutExpired:
             return False,'file-transfer runtime validation timed out'
         if transfer.returncode:
@@ -208,7 +208,7 @@ def validate_runtime(target):
         try:
             wxp2p=subprocess.run(wxp2p_command,stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE,timeout=20)
+                                 stderr=subprocess.PIPE,timeout=20,env={})
         except subprocess.TimeoutExpired:
             return False,'WXP2P runtime validation timed out'
         if wxp2p.returncode:
@@ -221,7 +221,7 @@ def validate_runtime(target):
         try:
             combined=subprocess.run(combined_command,input=b'{"action":"quit"}\n',
                                     stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                                    timeout=20)
+                                    timeout=20,env={})
         except subprocess.TimeoutExpired:
             return False,'combined WXP2P runtime validation timed out'
         try:

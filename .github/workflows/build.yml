@@ -6,6 +6,27 @@ on:
   pull_request:
 
 jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 2
+            cores = 2
+      - name: 检查 flake 并构建 Nix 包
+        run: |
+          nix flake check --no-write-lock-file --print-build-logs
+      - name: 检查源码包中的 Nix 入口
+        run: |
+          python3 tools/package_release.py
+          mkdir -p "$RUNNER_TEMP/wetypex-source"
+          tar -xzf dist/arch/fcitx5-wetypex-*.tar.gz -C "$RUNNER_TEMP/wetypex-source"
+          source_dir=$(find "$RUNNER_TEMP/wetypex-source" -mindepth 1 -maxdepth 1 -type d)
+          nix flake check "path:$source_dir" --no-build --no-write-lock-file
+
   arch-linux:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
@@ -71,12 +92,15 @@ jobs:
       - name: 生成 deb 与校验和
         run: |
           version=$(sed -n 's/^project([^ ]* VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+          revision=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD.in)
           sed -e "s|@WETYPEX_VERSION@|$version|g" \
+            -e "s|@WETYPEX_RELEASE@|$revision|g" \
             -e "s|@WETYPEX_STAGE@|$PWD/dist/debian-root|g" \
             -e "s|@WETYPEX_PROJECT_ROOT@|$PWD|g" \
             packaging/nfpm.yaml > dist/nfpm-debian.yaml
           "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-debian.yaml \
             --packager deb --target dist/debian/
+          test "$(dpkg-deb -f dist/debian/*.deb Version)" = "$version-$revision"
           cd dist/debian
           sha256sum fcitx5-wetypex_*.deb > SHA256SUMS
       - name: 保存兼容旧系统的 deb
@@ -138,6 +162,7 @@ jobs:
           version=$(sed -n 's/^project([^ ]* VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
           revision=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD.in)
           sed -e "s|@WETYPEX_VERSION@|$version|g" \
+            -e "s|@WETYPEX_RELEASE@|$revision|g" \
             -e "s|@WETYPEX_STAGE@|$PWD/dist/ubuntu20-root|g" \
             -e "s|@WETYPEX_PROJECT_ROOT@|$PWD|g" \
             -e 's/libc6 (>= 2.35)/libc6 (>= 2.31)/' \
@@ -147,6 +172,7 @@ jobs:
             packaging/nfpm.yaml > dist/nfpm-focal.yaml
           "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-focal.yaml --packager deb \
             --target "dist/ubuntu20/fcitx5-wetypex-legacy_${version}-${revision}_amd64.deb"
+          test "$(dpkg-deb -f dist/ubuntu20/*.deb Version)" = "$version-$revision"
           cd dist/ubuntu20
           sha256sum *.deb > SHA256SUMS
       - uses: actions/upload-artifact@v7

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PipeWire capture and session control for the original native voice engine."""
+"""PipeWire/PulseAudio capture and session control for the original native voice engine."""
 import argparse
 import array
 import fcntl
@@ -61,6 +61,71 @@ def punctuation(text, mode):
     return text
 
 
+def recorder_options():
+    try:
+        result = subprocess.run(['pw-record', '--help'], capture_output=True,
+                                timeout=3)
+        if result.returncode == 0:
+            options = result.stdout + result.stderr
+            if b'--raw' in options and shutil.which('pw-dump'):
+                # Installed tools do not prove an audio server is available.
+                # Screen-casting PipeWire instances may have no audio source.
+                probe = subprocess.run(['pw-dump'], capture_output=True,
+                                       timeout=1)
+                if probe.returncode != 0:
+                    return b''
+                try:
+                    nodes = json.loads(probe.stdout)
+                    def audio_source(node):
+                        info = node.get('info') if isinstance(node, dict) else None
+                        props = info.get('props') if isinstance(info, dict) else None
+                        return isinstance(props, dict) and props.get('media.class') == 'Audio/Source'
+                    if not isinstance(nodes, list) or not any(map(audio_source, nodes)):
+                        return b''
+                except ValueError:
+                    return b''
+            return options
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return b''
+
+
+def microphone_command(config):
+    microphone = config.get('voice_microphone', '自动检测')
+    selected = microphone and microphone != '自动检测'
+    options = recorder_options()
+    if b'--raw' in options:
+        command = ['pw-record', '--raw', '--rate', '16000', '--channels', '1',
+                   '--format', 's16', '--latency', '20ms']
+        if b'--properties' in options:
+            command += ['--properties',
+                        'application.name=WeTypeX node.name=wetypex-voice-input'
+                        + (' node.dont-fallback=true' if selected else '')]
+        if selected:
+            command += ['--target', str(microphone)]
+        return 'pipewire', command + ['-']
+    # Old pw-record (including Ubuntu 22.04's 0.3.48) cannot produce this
+    # raw PCM stream. PulseAudio clients also work with pipewire-pulse.
+    if selected and str(microphone).isdigit():
+        # PipeWire and PulseAudio numbers belong to different namespaces.
+        # Reusing a saved PipeWire ID could record a different Pulse source.
+        raise RuntimeError('音频后端已变化，请在设置中重新选择麦克风')
+    if shutil.which('parec'):
+        command = ['parec', '--raw', '--rate=16000', '--channels=1',
+                   '--format=s16le', '--latency-msec=20',
+                   '--client-name=WeTypeX', '--stream-name=voice']
+        if selected:
+            command += ['--device=' + str(microphone)]
+        return 'pulse', command
+    if shutil.which('ffmpeg'):
+        return 'ffmpeg-pulse', [
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-f', 'pulse', '-sample_rate', '16000', '-channels', '1',
+            '-fragment_size', '640', '-i', str(microphone) if selected else 'default',
+            '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1']
+    raise RuntimeError('需要支持原始音频的 pw-record、parec 或 FFmpeg')
+
+
 class Backend:
     def __init__(self, owner):
         self.owner = owner
@@ -91,7 +156,13 @@ class Backend:
         binary = SUPPORT / 'wetypex-engine-host'
         if not binary.is_file() or not (RUNTIME / 'manifest.txt').is_file():
             raise RuntimeError('请先安装并准备原版运行时')
-        command = ['bwrap', '--unshare-pid', '--die-with-parent',
+        # This process outlives the recording thread that creates it.
+        # --die-with-parent also triggers when that *thread* exits; stdin EOF
+        # already shuts down the voice service when the controller exits.
+        wrapper = shutil.which('bwrap')
+        if not wrapper:
+            raise RuntimeError('请先安装 Bubblewrap')
+        command = [wrapper, '--unshare-pid',
                    '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib',
                    '--ro-bind', '/lib64', '/lib64', '--symlink', 'usr/bin', '/bin',
                    '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--dir', '/etc']
@@ -100,7 +171,7 @@ class Backend:
         for path in ('/etc/ssl', '/etc/pki', '/etc/ca-certificates'):
             command += ['--ro-bind-try', path, path]
         command += ['--ro-bind', str(RUNTIME), '/input', '--ro-bind', str(SUPPORT), '/support',
-                    '--bind', str(directory), '/work', '--chdir', '/work', '--clearenv',
+                    '--bind', str(directory), '/work', '--chdir', '/work',
                     '--setenv', 'PATH', '/usr/bin', '--setenv', 'HOME', '/work',
                     '--setenv', 'WETYPE_SUPPORT_DIR', '/support',
                     '--setenv', 'WETYPE_WORK_DIR', '/work/business',
@@ -113,7 +184,7 @@ class Backend:
         command += ['/support/wetypex-engine-host', '/input', 'voice-service']
         self.log = (VOICE / 'backend.log').open('wb')
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=self.log, bufsize=65536)
+                                        stderr=self.log, bufsize=65536, env={})
         os.set_blocking(self.process.stdin.fileno(), False)
         threading.Thread(target=self.receive, daemon=True).start()
 
@@ -132,6 +203,7 @@ class Backend:
                 else:
                     self.owner.receive(self, event)
         finally:
+            self.broken = True
             self.ready.set()
             self.owner.backend_failed(self)
 
@@ -175,6 +247,7 @@ class Job:
         self.request = request
         self.config = read_json(CONFIG)
         self.capture = None
+        self.capture_backend = ''
         self.reader = None
         self.backend = None
         self.cancelled = False
@@ -196,9 +269,9 @@ class Job:
         self.chunks = queue.Queue(maxsize=500)
 
     def stop_capture(self):
-        self.stopped.set()
         if self.stopped_at is None:
             self.stopped_at = time.monotonic()
+        self.stopped.set()
         if self.capture and self.capture.poll() is None:
             try:
                 self.capture.send_signal(signal.SIGINT)
@@ -210,7 +283,10 @@ class Job:
         self.stop_capture()
         self.owner.publish(self, 'recognizing', self.text)
         if immediate and self.stop_sent:
-            self.owner.send(self, {'op': 'finish'})
+            try:
+                self.owner.send(self, {'op': 'finish'})
+            except (OSError, RuntimeError) as error:
+                self.owner.fail(self, str(error))
 
     def cancel(self):
         self.cancelled = True
@@ -223,11 +299,29 @@ class Job:
         self.done.set()
 
     def capture_audio(self):
+        pending = bytearray()
+        last_audio = time.monotonic()
         try:
             while not self.cancelled and not self.done.is_set():
-                frame = self.capture.stdout.read(640)
-                if not frame:
+                current = time.monotonic()
+                if current - self.since > 600:
+                    self.stop_capture()
+                if not select.select([self.capture.stdout], [], [], .1)[0]:
+                    if self.stopped.is_set() and current - self.stopped_at > 1:
+                        break
+                    if current - last_audio > 5:
+                        raise RuntimeError('音频采集无响应，请检查所选麦克风和音频服务')
+                    continue
+                chunk = os.read(self.capture.stdout.fileno(), 640 - len(pending))
+                pending.extend(chunk)
+                if not chunk and not pending:
                     break
+                if chunk:
+                    last_audio = time.monotonic()
+                if chunk and len(pending) < 640:
+                    continue
+                frame = bytes(pending)
+                pending.clear()
                 if 'first_audio_ms' not in self.timing:
                     self.timing['first_audio_ms'] = round((time.monotonic() - self.requested) * 1000)
                 if len(frame) < 640:
@@ -241,8 +335,10 @@ class Job:
                 except queue.Full:
                     self.owner.fail(self, '语音服务未能及时启动')
                     break
-                if time.monotonic() - self.since > 600:
-                    self.stop_capture()
+                if not chunk:
+                    break
+        except (OSError, RuntimeError) as error:
+            self.owner.fail(self, str(error))
         finally:
             while not self.cancelled and not self.done.is_set():
                 try:
@@ -257,22 +353,18 @@ class Job:
                 return
             recording_log = (VOICE / 'capture.log').open('wb')
             if self.request.get('file'):
+                self.capture_backend = 'file'
                 command = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error']
                 if self.request.get('realtime'):
                     command += ['-re']
                 command += ['-protocol_whitelist', 'file,pipe', '-i', self.request['file'],
                             '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1']
             else:
-                command = ['pw-record', '--raw', '--rate', '16000', '--channels', '1',
-                           '--format', 's16', '--latency', '20ms', '--properties',
-                           'application.name=WeTypeX node.name=wetypex-voice-input']
-                microphone = self.config.get('voice_microphone', '自动检测')
-                if microphone and microphone != '自动检测':
-                    command += ['--target', str(microphone)]
-                command += ['-']
+                self.capture_backend, command = microphone_command(self.config)
             self.capture = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=recording_log)
             self.timing['capture_started_ms'] = round((time.monotonic() - self.since) * 1000)
             self.timing['capture_from_key_ms'] = round((time.monotonic() - self.requested) * 1000)
+            self.owner.publish(self, 'recording', self.text)
             if self.stopped.is_set():
                 self.stop_capture()
             self.reader = threading.Thread(target=self.capture_audio, daemon=True)
@@ -281,7 +373,7 @@ class Job:
             if not self.backend or not self.backend.ready.wait(20):
                 raise RuntimeError('连接语音服务超时')
             self.timing['backend_ready_ms'] = round((time.monotonic() - self.since) * 1000)
-            if self.backend.process.poll() is not None:
+            if self.backend.broken or self.backend.process.poll() is not None:
                 raise RuntimeError('原版语音服务启动失败，请检查 voice/backend.log')
             if not self.owner.send(self, {'op': 'start',
                                          'polish': bool(self.config.get('voice_smart_polish', True)),
@@ -347,7 +439,9 @@ class Service:
                 state = 'polishing'
             self.latest = dict(version=time.monotonic_ns(), daemon_pid=os.getpid(),
                                token=job.token, session=job.session,
-                               epoch=job.epoch, state=state, text=text, timings=dict(job.timing), **extra)
+                               epoch=job.epoch, state=state, text=text,
+                               capture_backend=job.capture_backend,
+                               timings=dict(job.timing), **extra)
             self.last_activity = time.monotonic()
             self.last_native_activity = self.last_activity
             if job.session:
@@ -491,7 +585,7 @@ class Service:
             return dict(self.latest, ok=True, daemon_pid=os.getpid(),
                         native_pid=self.backend.process.pid if self.backend and self.backend.process.poll() is None else None,
                         capture_pid=self.job.capture.pid if self.job and self.job.capture and self.job.capture.poll() is None else None,
-                        native_ready=bool(self.backend and self.backend.ready.is_set() and self.backend.process.poll() is None),
+                        native_ready=bool(self.backend and not self.backend.broken and self.backend.ready.is_set() and self.backend.process.poll() is None),
                         vad=bool(self.backend and self.backend.process.poll() is None and self.backend.vad))
 
 

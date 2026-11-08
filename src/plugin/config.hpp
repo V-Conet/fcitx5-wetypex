@@ -107,7 +107,9 @@ FCITX_CONFIGURATION(
     Option<std::string> microphone{this, "Microphone", "麦克风", "自动检测"};
     Option<VoicePunctuationMode> punctuation{this, "Punctuation", "标点设置",
                                              VoicePunctuationMode::Smart};
-    Option<bool> smartPolish{this, "SmartPolish", "语音智能整理", true};)
+    Option<bool> smartPolish{this, "SmartPolish", "语音智能整理", true};
+    Option<bool> copyToClipboard{this, "CopyToClipboard",
+                                 "识别后复制到剪贴板", true};)
 
 FCITX_CONFIGURATION(PhraseClipboardConfig,
                     Option<bool> clipboard{this, "Clipboard",
@@ -121,6 +123,11 @@ FCITX_CONFIGURATION(
     Option<int, IntConstrain> pageSize{this, "PageSize", "每页候选数", 5,
                                        IntConstrain(3, 9)};
     Option<bool> vertical{this, "Vertical", "候选词竖排", false};
+    Option<bool> autoSpace{this, "AutoSpace", "自动添加中英文空格", false};
+    Option<bool> autoSpaceDigit{this, "AutoSpaceDigit", "中文和数字间加空格",
+                                true};
+    Option<bool> autoSpaceEnglish{this, "AutoSpaceEnglish", "中文和英文间加空格",
+                                  true};
     Option<PreeditPosition> preeditPosition{
         this, "PreeditPosition", "拼音显示位置", PreeditPosition::Client};
     Option<CandidateLabelStyle> labelStyle{this, "CandidateLabelStyle",
@@ -149,7 +156,7 @@ FCITX_CONFIGURATION(
     Option<bool> vMode{this, "VMode", "V 模式", true}; KeyListOption vModeKeys{
         this,
         "VModeKeys",
-        "V 模式按键",
+        "V 模式入口（默认 v 后按空格）",
         {Key("v")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
     Option<bool> halfFull{this, "HalfFull", "全半角输入切换", false};
@@ -173,7 +180,7 @@ FCITX_CONFIGURATION(
         this,
         "TraditionalSwitchKeys",
         "简繁体输入切换按键",
-        {Key("Control+Shift+f")},
+        {Key("Control+Shift+F")},
         KeyListConstrain({KeyConstrainFlag::AllowModifierLess})};
     Option<bool> pageMinusEqual{this, "PageMinusEqual", "减号等号翻页", true};
     Option<bool> pageBrackets{this, "PageBrackets", "左右中括号翻页", true};

@@ -868,6 +868,16 @@ int main(int argc, char **argv) {
        row("默认输入语言（中文/英文）", {}, languageSetup, 52),
        row("模糊拼音", {}, fuzzySetup, 52)}));
   input.body->addWidget(rowsCard(
+      {row("自动添加中英文空格", "开启后自动调整汉字与英文字母、数字之间的间距",
+           toggle(wetype::settingBool(settings.value("auto_space"), false),
+                  true, "auto_space")),
+       row("中文和数字间加空格", "例如：你好 2024",
+           toggle(wetype::settingBool(settings.value("auto_space_digit"), true),
+                  true, "auto_space_digit")),
+       row("中文和英文间加空格", "例如：你好 Hello",
+           toggle(wetype::settingBool(settings.value("auto_space_english"), true),
+                  true, "auto_space_english"))}));
+  input.body->addWidget(rowsCard(
       {row("单机模式",
            "无需网络，单机离线使用。不支持跨设备、表情推荐、问 AI 等联网功能",
            toggle(wetype::settingBool(settings.value("standalone"), false),
@@ -996,6 +1006,12 @@ int main(int argc, char **argv) {
   voice.body->addWidget(
       rowsCard({row("麦克风", "设置语音输入的默认麦克风", microphone),
                 row("标点设置", {}, punctuationMode),
+                row("识别后复制到剪贴板",
+                    "识别完成后把结果写入系统剪贴板，终端等不接收输入的窗口可直接粘贴",
+                    toggle(wetype::settingBool(
+                               settings.value("voice_copy_to_clipboard"), true),
+                           true, "voice_copy_to_clipboard"),
+                    74),
                 row("语音智能整理", {},
                     toggle(wetype::settingBool(
                                settings.value("voice_smart_polish"), true),
@@ -1216,6 +1232,16 @@ int main(int argc, char **argv) {
       new QLabel("系统默认支持“ctrl + 空格”切换中英文  修改");
   defaultShortcut->setObjectName("rowSubtitle");
   shortcuts.body->addWidget(defaultShortcut);
+  QStringList vModeTriggers;
+  bool usesBareV = false;
+  for (const auto &key : settings.value("v_mode_keys").toString("v").simplified().split(' ')) {
+    if (key.isEmpty())
+      continue;
+    usesBareV |= key == "v";
+    vModeTriggers << (key == "v" ? QStringLiteral("v → 空格") : key);
+  }
+  if (vModeTriggers.isEmpty())
+    vModeTriggers << QStringLiteral("未绑定");
   shortcuts.body->addWidget(rowsCard(
       {row("快捷使用", {}, nullptr, 44),
        shortcutRow("AI 助手  Beta",
@@ -1223,8 +1249,9 @@ int main(int argc, char **argv) {
                    {"="}, "输入后按「=」可使用 AI 提问、表情推荐等功能", true,
                    "ai_assistant"),
        shortcutRow("V 模式",
-                   wetype::settingBool(settings.value("v_mode"), true), {"V"},
-                   "全拼中文空组合下按小写 v 打开；关闭后可直接输入 v 开头的词",
+                   wetype::settingBool(settings.value("v_mode"), true), vModeTriggers,
+                   usesBareV ? "v 后按空格打开；可继续输入英文或 v1+1 等计算式"
+                             : "使用已配置的按键直接打开，仅在中文全拼中生效",
                    true, "v_mode")}));
   shortcuts.body->addWidget(rowsCard(
       {row("语音输入", {}, nullptr, 44),
